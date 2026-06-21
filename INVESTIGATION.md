@@ -315,8 +315,54 @@ Classic BT audio requirement. With this, `connectStatus` would not be needed
 and the 30-second timer would not apply. This is the cleanest fix but requires
 firmware changes from the vendor.
 
-### Option 3: Web demo only for iOS/Android
+### Option 3: Android Chrome (likely works — untested as of 2026-06-22)
 
-Accept the Windows limitation. Add a clear message in the web demo UI when
-running on Windows (detected via `navigator.userAgent`) explaining that a
-native app is required. The demo continues to work correctly on iOS and Android.
+Android Chrome supports Web Bluetooth and — crucially — the Android OS native
+Bluetooth stack runs independently alongside Chrome. When `CMD_APP_SHOW_PAIR`
+causes the glasses to advertise for Classic BT, the Android OS detects it and
+shows a system-level pairing popup. Once the user accepts:
+
+1. Android OS pairs Classic BT (HFP audio connects)
+2. Glasses play "pi-pon"
+3. Glasses send `45 4D 68 00 ... 01`
+4. Web app sends `CMD_CONNECT_SUCCEED`
+5. `connectStatus=true` in BT status polls
+6. 30-second timer cleared — session continues indefinitely
+
+This is the same mechanism as a native Android app, just with Chrome handling
+the BLE side instead.
+
+**Note:** iOS Chrome will not work — Apple forces all iOS browsers to use
+WebKit, which has no Web Bluetooth API.
+
+**Code note:** On Android, TX notifications likely work before BLE pairing
+(Android is more permissive than Windows), so `TX [0x01]` may be received
+and handled before the user clicks "Continue". The long-press binding will
+be sent twice but `longPressConfirmResponse` is idempotent. The Classic BT
+system popup will appear during the flow and must be accepted.
+
+**Next test:** Run the web demo on an Android phone with Chrome and check:
+- Does the Android system Classic BT popup appear?
+- Does "pi-pon" play after accepting?
+- Does `45 4D 68 00 ... 01` appear in the log?
+- Does `connectStatus=true` appear in BT status polls?
+
+### Option 4: Electron app (for Windows)
+
+Replace the Chrome web demo with an Electron app. Node.js native Bluetooth
+bindings (`@abandonware/noble` for BLE + WinRT or `node-bluetooth` for Classic
+BT HFP) can replicate the full phone Bluetooth stack, triggering the "pi-pon"
+and clearing the timer.
+
+### Option 5: Firmware BLE-only mode (requires ThinkAR)
+
+Ask ThinkAR to add a firmware flag or command that makes the glasses skip the
+Classic BT audio requirement. With this, `connectStatus` would not be needed
+and the 30-second timer would not apply. This is the cleanest long-term fix but
+requires firmware changes from the vendor.
+
+---
+
+## Session End: 2026-06-22
+
+Work stopped here. Next action: test the web demo on Android Chrome (Option 3).

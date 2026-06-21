@@ -23,11 +23,14 @@
 
   <div class="inputs">
     <label>Original text</label>
-    <input id="original" type="text" value="Hello" placeholder="Original" />
+    <input id="original" type="text" value="Hello, world" placeholder="Original" />
     <label>Translation text</label>
-    <input id="translation" type="text" value="こんにちは" placeholder="Translation" />
+    <input id="translation" type="text" value="こんにちは, 世界" placeholder="Translation" />
   </div>
-  <button id="btnSend" disabled>Send Translation</button>
+  <button id="btnStart" disabled>Start (2s interval)</button>
+  <button id="btnStop" disabled>Stop</button>
+  <button id="btnReset" disabled>Reset Count</button>
+  <div id="counter" style="margin-top:8px; font-size:14px; color:#555;">Count: 1</div>
 
   <div id="log">Ready.</div>
 
@@ -158,6 +161,8 @@ const HANDSHAKE_TOKEN      = new Uint8Array([
 // ── State ──────────────────────────────────────────────────────────────────
 let device = null, writeChar = null;
 let sessionId = 1;
+let sendCount = 1;
+let autoTimer = null;
 
 // ── ACK waiting ────────────────────────────────────────────────────────────
 let ackResolve = null;
@@ -182,11 +187,19 @@ function log(msg, cls) {
 // ── UI ─────────────────────────────────────────────────────────────────────
 const btnConnect    = document.getElementById('btnConnect');
 const btnDisconnect = document.getElementById('btnDisconnect');
-const btnSend       = document.getElementById('btnSend');
+const btnStart      = document.getElementById('btnStart');
+const btnStop       = document.getElementById('btnStop');
+const btnReset      = document.getElementById('btnReset');
+const counterEl     = document.getElementById('counter');
 
 btnConnect.addEventListener('click', connect);
 btnDisconnect.addEventListener('click', disconnect);
-btnSend.addEventListener('click', sendTranslation);
+btnStart.addEventListener('click', startAuto);
+btnStop.addEventListener('click', stopAuto);
+btnReset.addEventListener('click', () => {
+  sendCount = 1;
+  counterEl.textContent = `Count: ${sendCount}`;
+});
 
 // ── Connect & handshake ────────────────────────────────────────────────────
 async function connect() {
@@ -267,7 +280,8 @@ async function connect() {
     await new Promise(r => setTimeout(r, 500));
 
     log('Glasses ready!', 'ok');
-    btnSend.disabled       = false;
+    btnStart.disabled      = false;
+    btnReset.disabled      = false;
     btnDisconnect.disabled = false;
     btnConnect.disabled    = true;
 
@@ -288,17 +302,15 @@ async function onTX(event) {
 
 // ── Send simultaneous translation ──────────────────────────────────────────
 async function sendTranslation() {
-  const original    = document.getElementById('original').value;
-  const translation = document.getElementById('translation').value;
+  const base    = document.getElementById('original').value;
+  const baseTr  = document.getElementById('translation').value;
+  const original    = `${base} ${sendCount}`;
+  const translation = `${baseTr} ${sendCount}`;
 
   try {
-    btnSend.disabled = true;
-    log(`Sending: "${original}" / "${translation}"`);
+    log(`Sending [${sendCount}]: "${original}" / "${translation}"`);
 
-    // Try large MTU first (185 = typical iOS negotiated MTU).
-    // Falls back to 23 if a write fails due to MTU limit.
-    let frames;
-    let mtu = 185;
+    let frames, mtu = 185;
     try {
       frames = buildTranslationFrames(sessionId, original, translation, mtu);
       for (const frame of frames) {
@@ -320,14 +332,33 @@ async function sendTranslation() {
     await waitForAck(1000);
     log(`Sent (${frames.length} frame(s), MTU=${mtu})`, 'ok');
 
-    // Increment session ID for next send (wraps at 255)
     sessionId = (sessionId % 255) + 1;
+    sendCount++;
+    counterEl.textContent = `Count: ${sendCount}`;
 
   } catch (e) {
     log(`Error: ${e.message}`, 'err');
-  } finally {
-    btnSend.disabled = false;
+    stopAuto();
   }
+}
+
+// ── Auto-send every 2 seconds ──────────────────────────────────────────────
+function startAuto() {
+  if (autoTimer) return;
+  log('Auto-send started (every 2 s)');
+  btnStart.disabled = true;
+  btnStop.disabled  = false;
+  sendTranslation();
+  autoTimer = setInterval(sendTranslation, 2000);
+}
+
+function stopAuto() {
+  if (!autoTimer) return;
+  clearInterval(autoTimer);
+  autoTimer = null;
+  log('Auto-send stopped');
+  btnStart.disabled = false;
+  btnStop.disabled  = true;
 }
 
 // ── Disconnect ─────────────────────────────────────────────────────────────

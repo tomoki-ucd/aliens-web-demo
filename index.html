@@ -275,10 +275,8 @@ async function connect() {
     }
     log('Handshake OK', 'ok');
 
-    // Phase 2: proactive pairing (TX notify not reliable on Windows)
-    log('Sending CMD_GLASS_LONG_PRESS…');
-    await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
-    await new Promise(r => setTimeout(r, 500));
+    // Phase 2: direct pairing without long-press (skipping CMD_GLASS_LONG_PRESS
+    // which triggers a 30-second long-press UI timeout on the glasses firmware)
     log('Sending CMD_APP_SHOW_PAIR…');
     await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
     await new Promise(r => setTimeout(r, 200));

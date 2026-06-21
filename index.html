@@ -4,9 +4,12 @@
   <meta charset="UTF-8">
   <title>AiLens BLE Demo</title>
   <style>
-    body { font-family: sans-serif; max-width: 500px; margin: 40px auto; padding: 0 20px; }
+    body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 20px; }
     button { padding: 10px 20px; font-size: 16px; margin: 6px 4px; cursor: pointer; }
     button:disabled { opacity: 0.4; cursor: default; }
+    .inputs { margin: 12px 0; display: flex; flex-direction: column; gap: 8px; }
+    .inputs label { font-size: 14px; font-weight: bold; }
+    .inputs input { padding: 8px; font-size: 15px; border: 1px solid #ccc; border-radius: 4px; }
     #log { margin-top: 20px; background: #f4f4f4; padding: 12px; border-radius: 6px;
            font-family: monospace; font-size: 13px; white-space: pre-wrap; min-height: 80px; }
     .ok  { color: green; }
@@ -16,31 +19,27 @@
 <body>
   <h2>AiLens BLE Demo</h2>
   <button id="btnConnect">Scan &amp; Connect</button>
-  <button id="btnHello" disabled>Write "Hello, world"</button>
   <button id="btnDisconnect" disabled>Disconnect</button>
+
+  <div class="inputs">
+    <label>Original text</label>
+    <input id="original" type="text" value="Hello" placeholder="Original" />
+    <label>Translation text</label>
+    <input id="translation" type="text" value="こんにちは" placeholder="Translation" />
+  </div>
+  <button id="btnSend" disabled>Send Translation</button>
+
   <div id="log">Ready.</div>
 
 <script>
 // ── UUIDs ──────────────────────────────────────────────────────────────────
-const SERVICE_UUID    = '00010000-0000-1000-8000-00805f9b5a6b';
-const WRITE_UUID      = '00010001-0000-1000-8000-00805f9b5a6b'; // host → device
-const TX_UUID         = '00010002-0000-1000-8000-00805f9b5a6b'; // device → host (notify)
-const HANDSHAKE_UUID  = '00010003-0000-1000-8000-00805f9b5a6b';
+const SERVICE_UUID   = '00010000-0000-1000-8000-00805f9b5a6b';
+const WRITE_UUID     = '00010001-0000-1000-8000-00805f9b5a6b';
+const TX_UUID        = '00010002-0000-1000-8000-00805f9b5a6b';
+const HANDSHAKE_UUID = '00010003-0000-1000-8000-00805f9b5a6b';
 
-// ── CRC-32 (ported directly from CRC.swift / metaCRC32) ───────────────────
-const CRC_TABLE = new Uint32Array([
-  0,517762881,1035525762,593801667,2071051524,1705890373,1187603334,1477774535,
-  4142103048,3896448329,3411780746,3582446539,2375206668,2471405645,2955549070,2935387855,
-  4078607185,3989238800,3466741203,3497929362,2288723541,2528052116,3044567895,2869925990,
-  100262233,455446040,943800283,647843994,2122865757,1616130844,1127252703,1575808414,
-  4176042467,3862246274,3310454625,3683510304,2207835367,2638514410,3150782341,1700891428,
-  235545579,282479786,867368297,762221096,1971035887,1806168494,1220755565,1444884268,
-  200524466,355446259,910892080,681014129,1887600566,1851658487,1295687988,1407635061,
-  4245731514,3821852667,3257262392,3732098553,2254609397,2562654212,3101930127,1619527543, // note: will fix with actual table
-]);
-
-// Build the real table from the Swift literal (signed → unsigned via >>> 0)
-const RAW = [
+// ── CRC-32 (metaCRC32 from CRC.swift) ─────────────────────────────────────
+const RAW_TABLE = [
   0,517762881,1035525762,593801667,2071051524,1705890373,1187603334,1477774535,
   -152864248,-398518967,-883186550,-712520757,-1919760628,-1823561651,-1339418226,-1359579441,
   -216360111,-305728496,-828226093,-797037934,-2006243755,-1766373100,-1244399401,-1425041514,
@@ -74,14 +73,12 @@ const RAW = [
   607963258,987801403,428087032,123238841,1598911870,1100028479,1660267516,2083112125,
   -757091726,-872161997,-278434576,-239402063,-1448210570,-1217241033,-1810443788,-1966424395,
 ];
+const CRC32_TABLE = new Uint32Array(RAW_TABLE.map(v => v >>> 0));
 
-const CRC32_TABLE = new Uint32Array(RAW.map(v => v >>> 0));
-
-function metaCRC32(bytes, init = 0) {
-  let crc = init >>> 0;
+function metaCRC32(bytes) {
+  let crc = 0;
   for (const b of bytes) {
-    const idx = ((b ^ (crc >>> 24)) & 0xFF);
-    crc = ((crc << 8) ^ CRC32_TABLE[idx]) >>> 0;
+    crc = ((crc << 8) ^ CRC32_TABLE[((b ^ (crc >>> 24)) & 0xFF)]) >>> 0;
   }
   return crc;
 }
@@ -90,55 +87,63 @@ function metaCRC32(bytes, init = 0) {
 function u16le(v) { return [v & 0xFF, (v >> 8) & 0xFF]; }
 function u32le(v) { v = v >>> 0; return [v & 0xFF, (v>>8)&0xFF, (v>>16)&0xFF, (v>>24)&0xFF]; }
 
-// ── Draw command packet builder ────────────────────────────────────────────
-// Mirrors getData() in DrawTextCommand.swift
-function buildDrawPacket(innerPayload) {
-  // innerPayload = the bytes after the 0x60 wrapper (type + params + text)
-  const payloadInnerLen = innerPayload.length;
+// ── Simultaneous Translation packet builder ────────────────────────────────
+// Mirrors TextToSimultaneousTranslationCommand + XRBinaryPacketFramer in Swift
+function buildTranslationFrames(sessionId, original, translation, mtu = 185) {
+  const enc = new TextEncoder();
+  const originalBytes  = [...enc.encode(original)];
+  const translationBytes = [...enc.encode(translation)];
 
-  // wrapped payload: [0x60, len_lo, len_hi, ...innerPayload]
-  const payload = [0x60, ...u16le(payloadInnerLen), ...innerPayload];
+  // TLV: [type(1), len_lo, len_hi, ...value]
+  const tlv89 = [0x89, ...u16le(originalBytes.length),    ...originalBytes];
+  const tlv8A = [0x8A, ...u16le(translationBytes.length), ...translationBytes];
 
-  // crc2 = CRC32 of payload
-  const crc2 = metaCRC32(payload);
+  // Inner content: [sessionId] + TLVs
+  const inner = [sessionId & 0xFF, ...tlv89, ...tlv8A];
 
-  // CommData Head: [0x50, payload_len(4), crc2(4), 0x00×16]
-  const commDataHead = [0x50, ...u32le(payload.length), ...u32le(crc2), ...new Array(16).fill(0)];
+  const BIN_TYPE = 0x67;
 
-  // crc1 = CRC32 of (commDataHead + payload)
-  const crc1 = metaCRC32([...commDataHead, ...payload]);
-
-  // Request Head: [0x50, 0x00, crc1(4), 0x00×4]
-  const requestHead = [0x50, 0x00, ...u32le(crc1), 0x00, 0x00, 0x00, 0x00];
-
-  const len = requestHead.length + commDataHead.length + payload.length;
-
-  // CMD Header: [0x45, 0x4D, 0x1A, 0x00, len_lo, len_hi, (len*2)_lo, (len*2)_hi]
-  const cmdHead = [0x45, 0x4D, 0x1A, 0x00, ...u16le(len), ...u16le(len * 2)];
-
-  return new Uint8Array([...cmdHead, ...requestHead, ...commDataHead, ...payload]);
-}
-
-function buildDrawText(text, x, y, width, height, textSize) {
-  const textBytes = new TextEncoder().encode(text);
-  const inner = [
-    0x01,                    // type = text
-    ...u16le(textSize),
-    ...u16le(x),
-    ...u16le(y),
-    ...u16le(width),
-    ...u16le(height),
-    ...textBytes,
+  // CommData Head: [binType(1), inner_len(4), CRC32(inner)(4), 0xFF×16]
+  const commHead = [
+    BIN_TYPE,
+    ...u32le(inner.length),
+    ...u32le(metaCRC32(inner)),
+    ...new Array(16).fill(0xFF),   // reserved override = all 0xFF (not 0x00 like canvas)
   ];
-  return buildDrawPacket(inner);
+
+  const commonData = [...commHead, ...inner];
+  const maxSub = Math.max(1, mtu - 18); // 18 = 8 (cmd head) + 10 (packet head)
+
+  const frames = [];
+  let index = 0, offset = 0;
+
+  while (offset < commonData.length) {
+    const end = Math.min(offset + maxSub, commonData.length);
+    const sub = commonData.slice(offset, end);
+    const isFirst = offset === 0;
+    const isLast  = end === commonData.length;
+
+    // sliceType: 0x00=begin, 0x01=middle, 0x02=end
+    const sliceType = isFirst ? 0x00 : (isLast ? 0x02 : 0x01);
+
+    // Packet head (10 bytes): [binType, sliceType, CRC32(sub)(4), index(4)]
+    const pktHead = [BIN_TYPE, sliceType, ...u32le(metaCRC32(sub)), ...u32le(index)];
+
+    const valueLen = pktHead.length + sub.length;  // 10 + sub.length
+
+    // CMD header (8 bytes): [45 4D 1A 00, valueLen(2), valueLen*2(2)]
+    const cmdHead = [0x45, 0x4D, 0x1A, 0x00, ...u16le(valueLen), ...u16le(valueLen * 2)];
+
+    frames.push(new Uint8Array([...cmdHead, ...pktHead, ...sub]));
+    offset = end;
+    index++;
+  }
+
+  return frames;
 }
 
 // ── Raw fixed commands ─────────────────────────────────────────────────────
-const CMD_OPEN_CANVAS  = new Uint8Array([0x45,0x4D,0x79,0x00,0x00,0x00,0x00,0x00]);
-const CMD_CLOSE_CANVAS = new Uint8Array([0x45,0x4D,0x7A,0x00,0x00,0x00,0x00,0x00]);
-const CMD_DISCONNECT   = new Uint8Array([0x45,0x4D,0x73,0x00,0x00,0x00,0x00,0x00]);
-
-// Handshake / pairing raw commands
+const CMD_DISCONNECT       = new Uint8Array([0x45,0x4D,0x73,0x00,0x00,0x00,0x00,0x00]);
 const CMD_GLASS_LONG_PRESS = new Uint8Array([0x45,0x4D,0x00,0x00,0x00,0x00,0x00,0x00]);
 const CMD_APP_SHOW_PAIR    = new Uint8Array([0x45,0x4D,0x67,0x00,0x01,0x00,0x02,0x00,0x01]);
 const CMD_DIRECT_PAIR      = new Uint8Array([0x45,0x4D,0x0C,0x01,0x00,0x00,0x00,0x00]);
@@ -152,25 +157,16 @@ const HANDSHAKE_TOKEN      = new Uint8Array([
 
 // ── State ──────────────────────────────────────────────────────────────────
 let device = null, writeChar = null;
+let sessionId = 1;
 
-// ── Command queue with ACK waiting ─────────────────────────────────────────
-// After each draw packet the glasses ACK on TX (starts with 0x4F 0x42).
-// We gate the next send behind a promise that resolves on ACK (or 300 ms timeout).
+// ── ACK waiting ────────────────────────────────────────────────────────────
 let ackResolve = null;
-
 function notifyAck() { if (ackResolve) { ackResolve(); ackResolve = null; } }
-
-function waitForAck(ms = 300) {
+function waitForAck(ms = 1000) {
   return new Promise(resolve => {
     ackResolve = resolve;
-    setTimeout(() => { if (ackResolve) { ackResolve = null; resolve(); } }, ms);
+    setTimeout(() => { ackResolve = null; resolve(); }, ms);
   });
-}
-
-async function sendCmd(bytes) {
-  if (!writeChar) throw new Error('Not connected');
-  await writeChar.writeValueWithoutResponse(bytes);
-  await waitForAck();
 }
 
 // ── Logging ────────────────────────────────────────────────────────────────
@@ -183,20 +179,20 @@ function log(msg, cls) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-// ── UI buttons ─────────────────────────────────────────────────────────────
+// ── UI ─────────────────────────────────────────────────────────────────────
 const btnConnect    = document.getElementById('btnConnect');
-const btnHello      = document.getElementById('btnHello');
 const btnDisconnect = document.getElementById('btnDisconnect');
+const btnSend       = document.getElementById('btnSend');
 
 btnConnect.addEventListener('click', connect);
-btnHello.addEventListener('click', writeHello);
 btnDisconnect.addEventListener('click', disconnect);
+btnSend.addEventListener('click', sendTranslation);
 
 // ── Connect & handshake ────────────────────────────────────────────────────
 async function connect() {
   try {
     btnConnect.disabled = true;
-    log('Scanning for AiLens devices…');
+    log('Scanning for Ai Lens devices…');
 
     device = await navigator.bluetooth.requestDevice({
       acceptAllDevices: true,
@@ -204,10 +200,9 @@ async function connect() {
     });
     if (!device.name?.includes('Ai Lens')) {
       device.gatt.disconnect();
-      throw new Error(`Selected device "${device.name}" is not an Ai Lens device`);
+      throw new Error(`"${device.name}" is not an Ai Lens device`);
     }
     log(`Found: ${device.name}`);
-
     device.addEventListener('gattserverdisconnected', onDisconnected);
 
     log('Connecting to GATT…');
@@ -222,60 +217,45 @@ async function connect() {
       } catch (e) {
         log(`GATT attempt ${attempt} failed (${e.message}), retrying…`);
         await new Promise(r => setTimeout(r, 1000));
-        if (attempt === 5) throw new Error('Could not establish GATT connection after 5 attempts');
+        if (attempt === 5) throw new Error('Could not connect after 5 attempts');
       }
     }
-    // Give Windows Bluetooth stack a moment before service discovery
+
     await new Promise(r => setTimeout(r, 500));
-    const service = await server.getPrimaryService(SERVICE_UUID);
+    const service  = await server.getPrimaryService(SERVICE_UUID);
+    writeChar      = await service.getCharacteristic(WRITE_UUID);
+    const txChar   = await service.getCharacteristic(TX_UUID);
+    const hsChar   = await service.getCharacteristic(HANDSHAKE_UUID);
+    log('Characteristics ready');
 
-    log('Getting write characteristic…');
-    writeChar       = await service.getCharacteristic(WRITE_UUID);
-    log('Getting TX characteristic…');
-    const txChar    = await service.getCharacteristic(TX_UUID);
-    log('Getting handshake characteristic…');
-    const hsChar    = await service.getCharacteristic(HANDSHAKE_UUID);
-
-    // Log actual properties
-    const txProps = txChar.properties;
-    const hsProps = hsChar.properties;
-    log(`TX properties: notify=${txProps.notify} indicate=${txProps.indicate} write=${txProps.write} writeWithoutResponse=${txProps.writeWithoutResponse}`);
-    log(`HS properties: notify=${hsProps.notify} indicate=${hsProps.indicate} write=${hsProps.write} writeWithoutResponse=${hsProps.writeWithoutResponse}`);
-
-    // Best-effort TX notifications (needed for ACKs during drawing)
-    log('Starting TX notifications…');
-    let txNotifyWorking = false;
+    // Best-effort TX notifications (for ACKs)
     try {
       await txChar.startNotifications();
       txChar.addEventListener('characteristicvaluechanged', onTX);
-      txNotifyWorking = true;
-      log('TX notifications started');
+      log('TX notifications enabled');
     } catch(e) {
-      log(`TX notifications unavailable (${e.message}) — using proactive pairing`);
+      log(`TX notifications unavailable (${e.message}) — continuing`);
       txChar.addEventListener('characteristicvaluechanged', onTX);
     }
 
-    // ── Phase 1: token handshake ──
+    // Phase 1: handshake token
     log('Writing handshake token…');
     try {
       await hsChar.writeValueWithResponse(HANDSHAKE_TOKEN);
     } catch(e) {
       await hsChar.writeValueWithoutResponse(HANDSHAKE_TOKEN);
     }
-    log('Handshake token sent, waiting…');
     await new Promise(r => setTimeout(r, 250));
-    log('Reading handshake response…');
-    const hsVal = await hsChar.readValue();
+    const hsVal   = await hsChar.readValue();
     const hsBytes = new Uint8Array(hsVal.buffer);
-    log(`HS response: len=${hsBytes.length} b0=0x${hsBytes[0]?.toString(16)}`);
+    log(`Handshake response: len=${hsBytes.length} b0=0x${hsBytes[0]?.toString(16)}`);
 
     if (hsBytes.length !== 18 || ![0x64, 0x65, 0x66].includes(hsBytes[0])) {
-      throw new Error(`Handshake failed (len=${hsBytes.length}, b0=0x${hsBytes[0]?.toString(16)})`);
+      throw new Error(`Handshake failed (b0=0x${hsBytes[0]?.toString(16)})`);
     }
     log('Handshake OK', 'ok');
 
-    // ── Phase 2 & 3: pairing ──
-    // TX notifications don't work on Windows, so send pairing commands proactively
+    // Phase 2: proactive pairing (TX notify not reliable on Windows)
     log('Sending pairing commands…');
     await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
     await new Promise(r => setTimeout(r, 500));
@@ -287,7 +267,7 @@ async function connect() {
     await new Promise(r => setTimeout(r, 500));
 
     log('Glasses ready!', 'ok');
-    btnHello.disabled      = false;
+    btnSend.disabled       = false;
     btnDisconnect.disabled = false;
     btnConnect.disabled    = true;
 
@@ -297,72 +277,56 @@ async function connect() {
   }
 }
 
-// ── TX notification handler (pairing state machine + ACK) ─────────────────
+// ── TX handler ─────────────────────────────────────────────────────────────
 async function onTX(event) {
-  const data  = new Uint8Array(event.target.value.buffer);
-  const hex   = [...data].map(b => b.toString(16).padStart(2,'0')).join(' ');
-
-  // ACK: starts with 4F 42
-  if (data[0] === 0x4F && data[1] === 0x42) {
-    notifyAck();
-    return;
-  }
-
-  // Pairing step 1: single byte 0x01 → send long-press command
-  if (data.length === 1 && data[0] === 0x01) {
-    log('TX: long-press prompt → sending response');
-    await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
-    return;
-  }
-
-  // Pairing step 2: longPressConfirmResponse  4F 42 00 00 01 00 02 00 00
-  if (data.length === 9 && data[0]===0x4F && data[1]===0x42 && data[8]===0x00) {
-    log('TX: long-press confirmed → sending pair commands');
-    await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
-    await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
-    await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
-    return;
-  }
-
-  // Ready: starts with 45 4D 68 00
-  if (data[0]===0x45 && data[1]===0x4D && data[2]===0x68 && data[3]===0x00) {
-    log('Glasses ready!', 'ok');
-    btnHello.disabled      = false;
-    btnDisconnect.disabled = false;
-    btnConnect.disabled    = true;
-    return;
-  }
-
-  // IMU data: starts with 45 4D 15 00
-  if (data[0]===0x45 && data[1]===0x4D && data[2]===0x15 && data[3]===0x00) {
-    return; // ignore for this demo
-  }
-
+  const data = new Uint8Array(event.target.value.buffer);
+  if (data[0] === 0x4F && data[1] === 0x42) { notifyAck(); return; }
+  if (data[0] === 0x45 && data[1] === 0x4D && data[2] === 0x15) return; // IMU, ignore
+  const hex = [...data].map(b => b.toString(16).padStart(2,'0')).join(' ');
   log(`TX: ${hex}`);
 }
 
-// ── Write "Hello, world" ───────────────────────────────────────────────────
-async function writeHello() {
+// ── Send simultaneous translation ──────────────────────────────────────────
+async function sendTranslation() {
+  const original    = document.getElementById('original').value;
+  const translation = document.getElementById('translation').value;
+
   try {
-    btnHello.disabled = true;
-    log('Sending Hello, world…');
+    btnSend.disabled = true;
+    log(`Sending: "${original}" / "${translation}"`);
 
-    await sendCmd(CMD_OPEN_CANVAS);
-    log('Canvas opened');
+    // Try large MTU first (185 = typical iOS negotiated MTU).
+    // Falls back to 23 if a write fails due to MTU limit.
+    let frames;
+    let mtu = 185;
+    try {
+      frames = buildTranslationFrames(sessionId, original, translation, mtu);
+      for (const frame of frames) {
+        await writeChar.writeValueWithoutResponse(frame);
+      }
+    } catch (e) {
+      if (e.name === 'InvalidModificationError' || e.message.includes('MTU')) {
+        log('MTU too large, retrying with 23-byte MTU…');
+        mtu = 23;
+        frames = buildTranslationFrames(sessionId, original, translation, mtu);
+        for (const frame of frames) {
+          await writeChar.writeValueWithoutResponse(frame);
+        }
+      } else {
+        throw e;
+      }
+    }
 
-    const drawPacket = buildDrawText('Hello, world', 0, 0, 640, 60, 30);
-    await sendCmd(drawPacket);
-    log('Text sent', 'ok');
+    await waitForAck(1000);
+    log(`Sent (${frames.length} frame(s), MTU=${mtu})`, 'ok');
 
-    // Keep visible for 3 seconds, then clear
-    await new Promise(r => setTimeout(r, 3000));
-    await sendCmd(CMD_CLOSE_CANVAS);
-    log('Canvas closed');
+    // Increment session ID for next send (wraps at 255)
+    sessionId = (sessionId % 255) + 1;
 
   } catch (e) {
     log(`Error: ${e.message}`, 'err');
   } finally {
-    btnHello.disabled = false;
+    btnSend.disabled = false;
   }
 }
 
@@ -377,11 +341,11 @@ async function disconnect() {
 
 function onDisconnected() {
   log('Disconnected');
-  writeChar = null;
-  device    = null;
+  writeChar  = null;
+  device     = null;
   ackResolve = null;
   btnConnect.disabled    = false;
-  btnHello.disabled      = true;
+  btnSend.disabled       = true;
   btnDisconnect.disabled = true;
 }
 </script>

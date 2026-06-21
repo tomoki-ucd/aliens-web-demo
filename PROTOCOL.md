@@ -66,19 +66,30 @@ This step authenticates the host application to the glasses firmware.
 
 ### Phase 2 — Pairing (Write characteristic `00010001`, TX characteristic `00010002`)
 
-On iOS the pairing state machine is driven by TX notifications arriving from the
-glasses. On Windows, `startNotifications()` on the TX characteristic fails with
-a GATT error, so the demo sends the pairing commands proactively with fixed
-delays instead of waiting for TX events.
+The glasses **require a physical long-press of the touch bar** to complete
+pairing. The firmware shows a pairing UI after receiving `glassShowLongPressCommand`
+and waits up to ~30 seconds for the long-press; if no press occurs it disconnects.
 
-The commands are sent to the **Write characteristic** in this order:
+On iOS the pairing state machine is fully event-driven via TX notifications:
 
-| Step | Delay before next | Bytes (hex) | Purpose |
+1. Glasses → TX `[0x01]` → host sends `glassShowLongPressCommand`
+2. User long-presses touch bar
+3. Glasses → TX `longPressConfirmResponse` (`4F 42 00 00 01 00 02 00 00`) → host sends `appShowPairCommand` + `directPairCommand` + `confirmationCommand`
+4. Glasses → TX `45 4D 68 00` → host declares ready
+
+On **Windows**, `startNotifications()` fails so TX events are never received.
+The demo works around this by showing a **"Continue (long-press done)"** button
+in the UI. The user long-presses the glasses, then clicks the button, and only
+then does the demo send the remaining pairing commands.
+
+Commands sent to the Write characteristic and their timing:
+
+| Step | Trigger | Bytes (hex) | Purpose |
 |---|---|---|---|
-| `glassShowLongPressCommand` | 500 ms | `45 4D 00 00 00 00 00 00` | Tell glasses to show pairing UI |
-| `appShowPairCommand` | 200 ms | `45 4D 67 00 01 00 02 00 01` | App confirms it wants to pair |
-| `directPairCommand` | 200 ms | `45 4D 0C 01 00 00 00 00` | Request direct (non-interactive) pairing |
-| `confirmationCommand` | 500 ms | `45 4D 69 00 01 00 02 00 01` | Confirm pairing completion |
+| `glassShowLongPressCommand` | Immediately after handshake | `45 4D 00 00 00 00 00 00` | Tell glasses to show pairing UI |
+| `appShowPairCommand` | After user clicks "Continue" | `45 4D 67 00 01 00 02 00 01` | App confirms it wants to pair |
+| `directPairCommand` | 200 ms after above | `45 4D 0C 01 00 00 00 00` | Request direct (non-interactive) pairing |
+| `confirmationCommand` | 200 ms after above | `45 4D 69 00 01 00 02 00 01` | Confirm pairing completion |
 
 After this sequence the glasses are ready to receive commands.
 
@@ -86,7 +97,7 @@ After this sequence the glasses are ready to receive commands.
 
 On iOS, the glasses send a TX notification starting with `45 4D 68 00` to signal
 readiness. On Windows this notification is not received because TX notifications
-fail, so the demo declares ready after the fixed pairing delay instead.
+fail, so the demo declares ready 500 ms after `confirmationCommand` instead.
 
 ### Disconnect
 
@@ -100,16 +111,19 @@ Send to Write characteristic:
 
 - Do **not** pair the glasses at the Windows OS level (Settings → Bluetooth).
   OS-level pairing blocks Web Bluetooth from accessing GATT characteristics.
+  If a Windows Bluetooth pairing popup appears during the glasses long-press,
+  dismiss/cancel it — do not complete it.
 - `startNotifications()` on the TX characteristic fails with
   `GATT Error: invalid attribute length` on Windows. The demo catches and ignores
-  this error. ACK waiting falls back to a 1-second timeout.
+  this error. ACK waiting falls back to a 1-second timeout, and the long-press
+  confirmation is handled by a UI button instead (see Phase 2 above).
 - `device.gatt.connect()` may time out on the first attempt. The demo retries up
   to 5 times with a 1-second delay between attempts.
 - A 500 ms delay is inserted after `gatt.connect()` before service discovery to
   give the Windows Bluetooth stack time to settle.
-- The glasses disconnect unexpectedly after ~30 seconds on Windows, likely due to
-  a BLE link supervision timeout in the Windows Bluetooth stack. The demo handles
-  this with automatic reconnect (see Section 8).
+- Sending `glassShowLongPressCommand` starts a ~30-second firmware timer on the
+  glasses. If the user does not long-press within that window, the glasses
+  disconnect. Always long-press promptly after the "Continue" button appears.
 
 ---
 
@@ -369,7 +383,9 @@ hsChar.readValue()
   └─ verify: length=18, byte[0] in {0x64, 0x65, 0x66}
 
 writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS)
-wait 500 ms
+  └─ UI shows "Continue (long-press done)" button
+  └─ user long-presses touch bar on glasses
+  └─ user clicks button in browser   ← replaces TX longPressConfirmResponse on Windows
 writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR)
 wait 200 ms
 writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR)
@@ -380,31 +396,20 @@ wait 500 ms
 → Glasses ready. Translation commands can now be sent.
 ```
 
-### 8.2 Auto-reconnect on unexpected disconnect
+### 8.2 Disconnect behavior
 
-The glasses may drop the BLE connection unexpectedly (observed at ~30 s on
-Windows). The demo handles this automatically:
+When the GATT connection drops (either user-initiated or unexpected), the demo:
 
 ```
 gattserverdisconnected event fires
-  └─ writeChar set to null, interval timer cleared
-  └─ if wasAutoRunning → reconnect()
-       └─ device.gatt.connect()  ← retry up to 5× (same device object reused)
-       └─ re-discover characteristics
-       └─ re-run handshake + pairing sequence (identical to initial connection)
-       └─ resume startAuto() automatically
-     else → show Disconnected, re-enable Connect button
+  └─ auto-send stopped, writeChar set to null
+  └─ "Continue" button hidden (in case disconnect happened mid-pairing)
+  └─ Connect button re-enabled — user must reconnect manually
 ```
 
-**Race condition note:** the `setInterval` tick may fire at the same moment as
-the disconnect event, causing `sendTranslation()` to see `writeChar === null`.
-The demo guards against this:
-
-- `wasAutoRunning` is a dedicated flag set in `startAuto()` / `stopAuto()`,
-  independent of whether `autoTimer` is non-null at the instant of disconnect.
-- `sendTranslation()` returns early (without calling `stopAuto()`) if `writeChar`
-  is null at entry or after a caught error, allowing `reconnect()` to resume the
-  loop instead.
+The ~30-second firmware timeout (glasses disconnect if no long-press received)
+is avoided by having the user actually long-press before the remaining pairing
+commands are sent. See Windows-specific notes in Section 2.
 
 ---
 
@@ -422,13 +427,13 @@ All protocol logic lives in `index.html`:
 | `metaCRC32(bytes)` | CRC-32 checksum (custom variant from CRC.swift) |
 | `u16le(v)` / `u32le(v)` | Little-endian byte encoding helpers |
 | `buildTranslationFrames(sessionId, original, translation, mtu)` | Builds one or more BLE frames for the simultaneous translation command |
-| `connect()` | Full connection + pairing sequence (initial connect only) |
-| `reconnect()` | Re-runs handshake + pairing using the existing `device` object after unexpected disconnect; resumes auto-send if `wasAutoRunning` is true |
-| `onTX(event)` | TX notification handler (ACK, pairing events) |
-| `sendTranslation()` | Sends original + translation text with incrementing `sendCount` appended; returns early if `writeChar` is null |
-| `startAuto()` | Starts 2-second auto-send interval; sets `wasAutoRunning = true` |
-| `stopAuto()` | Stops auto-send interval; sets `wasAutoRunning = false` |
-| `onDisconnected()` | Handles `gattserverdisconnected` event; clears timer without resetting `wasAutoRunning`; triggers `reconnect()` if auto was running |
+| `connect()` | Full connection + pairing sequence |
+| `waitForUserLongPress()` | Returns a Promise that resolves when the user clicks "Continue (long-press done)"; shows/hides the button |
+| `onTX(event)` | TX notification handler; logs all TX bytes including ACKs |
+| `sendTranslation()` | Sends original + translation text with incrementing `sendCount` appended |
+| `startAuto()` | Starts 2-second auto-send interval |
+| `stopAuto()` | Stops auto-send interval |
+| `onDisconnected()` | Handles `gattserverdisconnected` event; stops auto-send, hides Continue button, resets UI |
 | `disconnect()` | User-initiated disconnect: sends disconnect command and cleans up state |
 
 Key state variables:
@@ -439,4 +444,4 @@ Key state variables:
 | `sessionId` | 1-byte translation session counter, wraps 1–255 |
 | `sendCount` | Display counter appended to each sent string; reset by Reset Count button |
 | `autoTimer` | `setInterval` handle; `null` when auto-send is not running |
-| `wasAutoRunning` | Persists intent to auto-send across a disconnect/reconnect cycle |
+| `longPressResolve` | Resolve function for the `waitForUserLongPress()` promise; `null` when not waiting |

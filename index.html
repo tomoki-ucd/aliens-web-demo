@@ -147,11 +147,13 @@ function buildTranslationFrames(sessionId, original, translation, mtu = 185) {
 }
 
 // ── Raw fixed commands ─────────────────────────────────────────────────────
-const CMD_DISCONNECT       = new Uint8Array([0x45,0x4D,0x73,0x00,0x00,0x00,0x00,0x00]);
-const CMD_GLASS_LONG_PRESS = new Uint8Array([0x45,0x4D,0x00,0x00,0x00,0x00,0x00,0x00]);
-const CMD_APP_SHOW_PAIR    = new Uint8Array([0x45,0x4D,0x67,0x00,0x01,0x00,0x02,0x00,0x01]);
-const CMD_DIRECT_PAIR      = new Uint8Array([0x45,0x4D,0x0C,0x01,0x00,0x00,0x00,0x00]);
-const CMD_CONFIRMATION     = new Uint8Array([0x45,0x4D,0x69,0x00,0x01,0x00,0x02,0x00,0x01]);
+const CMD_DISCONNECT         = new Uint8Array([0x45,0x4D,0x73,0x00,0x00,0x00,0x00,0x00]);
+const CMD_GLASS_LONG_PRESS   = new Uint8Array([0x45,0x4D,0x00,0x00,0x00,0x00,0x00,0x00]);
+const CMD_APP_SHOW_PAIR      = new Uint8Array([0x45,0x4D,0x67,0x00,0x01,0x00,0x02,0x00,0x01]);
+// connectSucceedResponseCommand from iOS SDK — sent in response to 45 4D 68 00 ... 01
+const CMD_CONNECT_SUCCEED    = new Uint8Array([0x4F,0x42,0x68,0x00,0x00,0x00,0x00,0x00]);
+// reportBluetoothStatusCommand from iOS SDK — polled every 1 s to keep connection alive
+const CMD_BT_STATUS_POLL     = new Uint8Array([0x45,0x4D,0x3A,0x00,0x00,0x00,0x00,0x00]);
 const HANDSHAKE_TOKEN      = new Uint8Array([
   0xA4,0x6A,0xD6,0xE0,0x35,0x82,0x00,0x00,
   0x10,0x01,0xC0,0xEF,0x1A,0x03,0x2B,0xA8,
@@ -166,6 +168,7 @@ let isReady = false;
 let sessionId = 1;
 let sendCount = 1;
 let autoTimer = null;
+let btStatusPollTimer = null;
 
 // ── ACK waiting ────────────────────────────────────────────────────────────
 let ackResolve = null;
@@ -175,6 +178,25 @@ function waitForAck(ms = 1000) {
     ackResolve = resolve;
     setTimeout(() => { ackResolve = null; resolve(); }, ms);
   });
+}
+
+// ── BT status polling (reportBluetoothStatusCommand, iOS SDK §beginClassicPairingConfirmation) ──
+// Glasses require periodic 45 4D 3A 00 polls to stay connected after pairing.
+function startBtStatusPolling() {
+  stopBtStatusPolling();
+  log('BT status polling started (1 s interval)');
+  btStatusPollTimer = setInterval(() => {
+    if (!writeChar) { stopBtStatusPolling(); return; }
+    writeChar.writeValueWithoutResponse(CMD_BT_STATUS_POLL)
+      .catch(e => log(`BT status poll error: ${e.message}`, 'err'));
+  }, 1000);
+}
+
+function stopBtStatusPolling() {
+  if (btStatusPollTimer !== null) {
+    clearInterval(btStatusPollTimer);
+    btStatusPollTimer = null;
+  }
 }
 
 // ── Logging ────────────────────────────────────────────────────────────────
@@ -299,15 +321,8 @@ async function connect() {
     await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
     log('*** Long-press the touch bar on your glasses, then click "Continue (long-press done)" ***');
     await waitForUserLongPress();
-    log('Long-press confirmed — sending pairing commands…');
+    log('Long-press confirmed — sending CMD_APP_SHOW_PAIR…');
     await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
-    await new Promise(r => setTimeout(r, 200));
-    log('Sending CMD_DIRECT_PAIR…');
-    await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
-    await new Promise(r => setTimeout(r, 200));
-    log('Sending CMD_CONFIRMATION…');
-    await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
-    await new Promise(r => setTimeout(r, 500));
 
     // Retry TX notifications now that the BLE link is paired/secured.
     if (!txNotificationsWorking) {
@@ -348,26 +363,45 @@ async function onTX(event) {
   if (hex === _lastTxHex && now - _lastTxMs < 200) return;
   _lastTxHex = hex; _lastTxMs = now;
 
-  // ── 4F 42 … — ACK family ────────────────────────────────────────────────
+  // ── 4F 42 … — ACK / response family ────────────────────────────────────
   if (data[0] === 0x4F && data[1] === 0x42) {
-    // longPressConfirmResponse = 4F 42 00 00 01 00 02 00 00 (9 bytes)
-    // iOS SDK responds to this with APP_SHOW_PAIR + DIRECT_PAIR + CONFIRMATION.
-    if (data.length === 9 &&
-        data[2]===0x00 && data[3]===0x00 && data[4]===0x01 &&
-        data[5]===0x00 && data[6]===0x02 && data[7]===0x00 && data[8]===0x00) {
-      log(`TX longPressConfirmResponse: ${hex}`);
-      if (isReady && writeChar) {
-        log('Sending post-confirm pairing (APP_SHOW_PAIR + DIRECT_PAIR + CONFIRMATION)…');
-        (async () => {
-          await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
-          await new Promise(r => setTimeout(r, 200));
-          await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
-          await new Promise(r => setTimeout(r, 200));
-          await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
-        })().catch(e => log(`Post-confirm error: ${e.message}`, 'err'));
+
+    // BT status response (4F 42 3A 00 ..., ≥11 bytes) — reply to CMD_BT_STATUS_POLL
+    // iOS SDK: extracts result[8], bonded[last-1], classicConnected[last]
+    if (data[2] === 0x3A && data[3] === 0x00 && data.length >= 11) {
+      const result          = data[8];
+      const bonded          = data[data.length - 2] === 0x01;
+      const classicConnected = data[data.length - 1] === 0x01;
+      log(`TX BT status: result=0x${result.toString(16)} bonded=${bonded} classicConnected=${classicConnected} [${hex}]`);
+      if (result === 0 && classicConnected) {
+        log('BT confirmed — connection fully established!', 'ok');
+        stopBtStatusPolling();
       }
       return;
     }
+
+    // longPressTimeoutResponse = 4F 42 00 00 01 00 02 00 1C (last byte 0x1C)
+    // iOS SDK: sets state = .disconnected
+    if (data.length === 9 &&
+        data[2]===0x00 && data[3]===0x00 && data[4]===0x01 &&
+        data[5]===0x00 && data[6]===0x02 && data[7]===0x00 && data[8]===0x1C) {
+      log(`TX longPressTimeoutResponse — long-press timed out`, 'err');
+      return;
+    }
+
+    // longPressConfirmResponse = 4F 42 00 00 01 00 02 00 00 (last byte 0x00)
+    // iOS SDK: send getPhoneSystemModelCommand (APP_SHOW_PAIR) only — no DIRECT_PAIR, no CONFIRMATION
+    if (data.length === 9 &&
+        data[2]===0x00 && data[3]===0x00 && data[4]===0x01 &&
+        data[5]===0x00 && data[6]===0x02 && data[7]===0x00 && data[8]===0x00) {
+      log(`TX longPressConfirmResponse: ${hex} — sending CMD_APP_SHOW_PAIR`);
+      if (writeChar) {
+        writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR)
+          .catch(e => log(`APP_SHOW_PAIR error: ${e.message}`, 'err'));
+      }
+      return;
+    }
+
     log(`TX ACK: ${hex}`);
     notifyAck();
     return;
@@ -375,29 +409,59 @@ async function onTX(event) {
 
   // ── 45 4D … — glasses-originated EM frames ──────────────────────────────
   if (data[0] === 0x45 && data[1] === 0x4D) {
+
+    // userPressPairingCheck = 45 4D 68 00 xx xx xx xx xx (9 bytes)
+    // iOS SDK: if last==0x01 → send connectSucceedResponseCommand + beginClassicPairingConfirmation
+    //          if last==0x00 → set state = .disconnected
     if (data[2] === 0x68 && data[3] === 0x00) {
-      log(`TX: 45 4D 68 00 — glasses signaled ready!`, 'ok');
+      if (data.length === 9 && data[8] === 0x01) {
+        log(`TX: 45 4D 68 00 ... 01 — pairing confirmed; sending connectSucceedResponse + starting BT polling`);
+        if (writeChar) {
+          (async () => {
+            await writeChar.writeValueWithoutResponse(CMD_CONNECT_SUCCEED);
+            // iOS SDK beginClassicPairingConfirmation() also sends APP_SHOW_PAIR before polling
+            await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
+            startBtStatusPolling();
+            if (!isReady) {
+              isReady = true;
+              log('Glasses fully ready!', 'ok');
+              btnStart.disabled      = false;
+              btnReset.disabled      = false;
+              btnDisconnect.disabled = false;
+              btnConnect.disabled    = true;
+            }
+          })().catch(e => log(`pairing confirm error: ${e.message}`, 'err'));
+        }
+      } else if (data.length === 9 && data[8] === 0x00) {
+        log(`TX: 45 4D 68 00 ... 00 — glasses rejected pairing`, 'err');
+      } else {
+        log(`TX: 45 4D 68 00 (${data.length} bytes): ${hex}`);
+      }
       return;
     }
+
     if (data[2] === 0x15 && data[3] === 0x00) { return; } // IMU, ignore silently
+
+    // 0x0010: session keepalive — reply with CMD_BT_STATUS_POLL (matches iOS poll pattern)
     if (data[2] === 0x10 && data[3] === 0x00) {
-      log(`TX 0x0010: ${hex} — replying with CMD_CONFIRMATION`);
-      if (writeChar) writeChar.writeValueWithoutResponse(CMD_CONFIRMATION)
+      log(`TX 0x0010: ${hex} — replying with BT status poll`);
+      if (writeChar) writeChar.writeValueWithoutResponse(CMD_BT_STATUS_POLL)
         .catch(e => log(`0x0010 reply error: ${e.message}`, 'err'));
       return;
     }
   }
 
   // ── TX [0x01] — glasses requesting long-press ────────────────────────────
-  // iOS SDK responds with CMD_GLASS_LONG_PRESS only; then waits for
-  // longPressConfirmResponse before sending the remaining pairing commands.
+  // iOS SDK: if no saved token → send glassShowLongPressCommand; waits for longPressConfirmResponse
+  //          if saved token   → pairingAcknowledged=true, beginClassicPairingConfirmation
+  // On Windows we always go through the long-press path (no saved token concept).
   if (data.length === 1 && data[0] === 0x01) {
     if (isReady && writeChar) {
       log('TX: 01 — sending CMD_GLASS_LONG_PRESS (awaiting longPressConfirmResponse)');
       writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS)
         .catch(e => log(`CMD_GLASS_LONG_PRESS error: ${e.message}`, 'err'));
     } else {
-      log('TX: 01 (during initial pairing)');
+      log('TX: 01 (during initial pairing — will be handled by TX events)');
     }
     return;
   }
@@ -480,6 +544,7 @@ async function disconnect() {
 function onDisconnected() {
   log('*** gattserverdisconnected fired ***', 'err');
   stopAuto();
+  stopBtStatusPolling();
   longPressResolve = null;
   btnLongPress.style.display = 'none';
   writeChar              = null;

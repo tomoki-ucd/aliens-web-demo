@@ -3,144 +3,149 @@
 ## Symptom
 
 On Windows with Chrome Web Bluetooth, the glasses (Ai Lens 071E) disconnect
-after almost exactly **30 seconds** from the moment the pairing sequence
-completes ("Glasses ready!"). The connection is otherwise healthy: data frames
-are sent and ACKs are received up until the moment of disconnect.
+after almost exactly **30.8 seconds** from the moment pairing completes
+("Glasses ready!"). The connection is otherwise healthy: data frames are sent
+and ACKs are received up until the moment of disconnect. The timing is
+completely consistent across every test run.
 
 ---
 
 ## What Was Ruled Out
 
-### 1. Long-press UI timeout (initial hypothesis — wrong)
+### 1. Long-press UI timeout
 **Theory:** `CMD_GLASS_LONG_PRESS` starts a 30-second timer waiting for the user
-to physically press the glasses. If nobody presses, the glasses disconnect.
+to physically press the glasses.
 
-**Fix attempted:** Added a "Continue (long-press done)" button so pairing commands
-are sent only *after* the user has actually long-pressed.
-
-**Result:** Disconnect still occurred at 30 seconds from "Glasses ready!" — not
-from when `CMD_GLASS_LONG_PRESS` was sent. The timer starts from pairing
+**Result:** Disconnect still occurred at 30.8 s from "Glasses ready!", not from
+when `CMD_GLASS_LONG_PRESS` was sent. Timer clearly starts from pairing
 completion, not from the long-press trigger.
 
-**Note:** The long-press fix was still kept because it is required for correct
-pairing: the remaining commands (`CMD_APP_SHOW_PAIR`, `CMD_DIRECT_PAIR`,
-`CMD_CONFIRMATION`) must be sent *after* the physical long-press, not
-with a blind 500 ms delay.
+**Note:** A "Continue (long-press done)" UI button was still added and kept,
+because the physical long-press IS required — the remaining pairing commands
+must be sent after it, not with a blind 500 ms delay.
 
 ### 2. Missing CCCD / TX notifications not subscribed
-**Theory:** `startNotifications()` on the TX characteristic fails on Windows
-with `"GATT Error: invalid attribute length"` before pairing. If the CCCD is
-not written, the glasses cannot deliver ACK notifications and may disconnect
-when they see no evidence the host is listening.
+**Theory:** `startNotifications()` fails on Windows before pairing
+(`"GATT Error: invalid attribute length"`). Glasses might disconnect when they
+see the CCCD is not set.
 
-**Fix attempted:** Retry `startNotifications()` after the pairing commands,
-at which point the BLE link is bonded/secured and the CCCD write may succeed.
+**Result:** Retrying `startNotifications()` after pairing succeeded. ACKs
+(`4F 42 …`) then arrived for every translation frame. Disconnect still occurred
+at 30.8 s.
 
-**Result:** The retry succeeded ("TX notifications enabled (post-pairing)").
-ACKs (`4F 42 …`) started arriving for every translation frame. But the
-disconnect still occurred at ~30 seconds.
+### 3. `TX 45 4D 10 00` keepalive request (initially suspected root cause)
+**Theory:** Glasses send `45 4D 10 00 02 00 04 00 19 00` at ~24 s, expect a
+response within 7 s, and disconnect if none comes.
 
----
+**Result:** After replying with `CMD_CONFIRMATION`, the `0x0010` message stopped
+appearing in logs — but the disconnect still happened at 30.8 s. So `0x0010`
+is a side-effect, not the primary cause. It is still handled with a
+`CMD_CONFIRMATION` reply as a precaution.
 
-## Key Log Evidence
+### 4. TX [0x01] not responded to
+**Theory:** Glasses send `TX [0x01]` right after "Glasses ready!" expecting
+`CMD_GLASS_LONG_PRESS` back. Ignoring it for 30 s causes disconnect.
 
-From a session where TX notifications were working and ACKs were received:
-
-```
-[20:49:00.9] TX notifications enabled (post-pairing)
-[20:49:00.9] Glasses ready!
-[20:49:00.9] TX: 01          ← initial TX events (pairing artefacts)
-[20:49:00.9] TX: 01
-[20:49:02.2] Auto-send started (every 2 s)
-[20:49:02.4] TX ACK: 4f 42 1a 00 06 00 0c 00 00 67 00 00 00 00
-[20:49:02.4] TX ACK: 4f 42 1a 00 06 00 0c 00 00 67 00 00 00 00  ← duplicate (bug, now fixed)
-...
-[20:49:24.6] TX: 45 4d 10 00 02 00 04 00 19 00   ← mystery message (×2)
-[20:49:24.6] TX: 45 4d 10 00 02 00 04 00 19 00
-...
-[20:49:31.7] *** gattserverdisconnected fired ***  ← 30.8 s after ready
-```
-
-### Observations
-- Disconnect is **initiated by the glasses**, not Chrome.
-- It happens **exactly ~30 seconds** after "Glasses ready!" regardless of how
-  much data is being sent or whether TX notifications are active.
-- An **unknown TX message** (`45 4D 10 00 02 00 04 00 19 00`) appears at
-  ~23.7 s after ready — **7 seconds before** the disconnect.
-- The message appeared twice due to a duplicate event listener bug (now fixed).
-
-### Duplicate TX event listener bug (now fixed)
-`startNotifications()` was attempted twice (once pre-pairing, once post-pairing).
-Although the pre-pairing attempt threw an exception, Chrome/Windows was still
-partially registering an internal listener, causing every notification to fire
-twice. Fixed by tracking `txNotificationsWorking` and only adding the
-`characteristicvaluechanged` event listener once, inside the `startNotifications()`
-call that actually succeeds.
+**Result:** Added handler: TX [0x01] → send `CMD_GLASS_LONG_PRESS` + full
+pairing sequence. The GATT error "operation already in progress" fired because
+TX [0x01] was arriving twice simultaneously. Fixed with a 200 ms dedup guard.
+Disconnect still occurred at 30.8 s.
 
 ---
 
-## Current Hypothesis
+## Duplicate TX Event Bug (fixed)
 
-### `TX 45 4D 10 00` is a session-renewal request
-
-Parsed against the standard EM command frame format:
-
-| Field    | Bytes     | Value                     |
-|----------|-----------|---------------------------|
-| Magic    | `45 4D`   | "EM"                      |
-| cmdType  | `10 00`   | `0x0010` (16)             |
-| len      | `02 00`   | 2                         |
-| len2     | `04 00`   | 4 (= len × 2 ✓)          |
-| payload  | `19 00`   | `[0x19, 0x00]` (25, 0)   |
-
-The glasses send this at ~24 s into a session. If the host does not respond
-within ~7 seconds, the glasses disconnect. This is consistent with a
-**keep-alive / session-renewal protocol** where the glasses periodically verify
-the host is still responsive.
-
-On iOS, the iOS SDK routes this message to `delegate?.onTxValueReceived(glasses:self, data:value)`.
-The iOS *app* (not the SDK) presumably handles it and sends a response. We do
-not have the iOS app source code, so the correct response command is unknown.
+Every BLE notification fired twice. Root causes investigated:
+- `startNotifications()` called twice (pre- and post-pairing). Even the failing
+  pre-pairing call partially registered an internal Chrome listener.
+- Fixed by tracking `txNotificationsWorking` and adding the
+  `characteristicvaluechanged` listener only once, inside whichever
+  `startNotifications()` call succeeds.
+- A global 200 ms dedup guard (`_lastTxHex` / `_lastTxMs`) was also added as a
+  belt-and-suspenders measure, since some events still fire twice.
 
 ---
 
-## Fix Attempted (status: untested)
+## Current Understanding of the Pairing State Machine
 
-In `onTX`, detect cmdType `0x0010` and reply immediately with `CMD_CONFIRMATION`
-(`45 4D 69 00 01 00 02 00 01`):
+From analysis of the iOS SDK (`MetaGlasses.swift`) and the TX event stream
+observed in logs, the correct event-driven pairing flow is:
 
-```js
-if (data[0] === 0x45 && data[1] === 0x4D && data[2] === 0x10 && data[3] === 0x00) {
-  log(`TX 0x0010 session-renewal: ${hex} — replying with CMD_CONFIRMATION`);
-  if (writeChar) {
-    writeChar.writeValueWithoutResponse(CMD_CONFIRMATION)
-      .catch(e => log(`0x0010 reply error: ${e.message}`, 'err'));
-  }
-  return;
-}
+```
+[After handshake + TX subscription]
+
+Glasses → TX [0x01]
+Host    → CMD_GLASS_LONG_PRESS
+                    (user physically long-presses touch bar)
+Glasses → TX longPressConfirmResponse  (4F 42 00 00 01 00 02 00 00)
+Host    → CMD_APP_SHOW_PAIR + CMD_DIRECT_PAIR + CMD_CONFIRMATION
+Glasses → TX 45 4D 68 00              (true "ready" signal)
+Host    → declares connected
 ```
 
-`CMD_CONFIRMATION` was chosen as a first guess because it is the last pairing
-command and semantically represents "I am ready". If this is wrong, the
-disconnect will still occur at 30 s. Other candidates to try:
+### Why this was broken on Windows
 
-| Response to try | Rationale |
-|---|---|
-| Echo exact bytes back (`45 4D 10 00 02 00 04 00 19 00`) | Generic ping-pong acknowledgment |
-| `CMD_DIRECT_PAIR` + `CMD_CONFIRMATION` | Full session re-confirmation |
-| `45 4D 11 00 00 00 00 00` | cmdType 0x0011 as a possible paired "response" opcode |
-| `45 4D 10 00 02 00 04 00 19 00` mirrored | Symmetric keepalive |
+TX notifications fail **before** pairing on Windows (CCCD write rejected). So:
+
+1. Glasses send TX `[0x01]` → we can't receive it (not subscribed)
+2. We send `CMD_GLASS_LONG_PRESS` proactively and wait for user button
+3. User long-presses → Glasses send `longPressConfirmResponse` → we can't receive it
+4. We send `CMD_APP_SHOW_PAIR + DIRECT_PAIR + CONFIRMATION` (triggered by button)
+5. TX notifications succeed **post-pairing**
+6. We declare "Glasses ready!" **prematurely** — the glasses' state machine
+   hasn't completed its expected event-driven cycle
+7. Glasses re-send TX `[0x01]` (because the previous one was missed)
+8. 30.8 s after step 6, glasses disconnect
+
+### Key TX messages observed
+
+| Bytes | Meaning | Handled |
+|---|---|---|
+| `4F 42 …` (generic) | ACK for a write command | `notifyAck()` |
+| `4F 42 00 00 01 00 02 00 00` | `longPressConfirmResponse` — pairing state machine trigger | Send `APP_SHOW_PAIR + DIRECT_PAIR + CONFIRMATION` |
+| `4F 42 67 00 …` | ACK for `CMD_APP_SHOW_PAIR` | `notifyAck()` |
+| `4F 42 0C 01 26 00 4C 00 …` | ACK for `CMD_DIRECT_PAIR`, includes device serial in payload (`MGG09B1224809005 4`) | `notifyAck()` |
+| `4F 42 69 00 …` | ACK for `CMD_CONFIRMATION` | `notifyAck()` |
+| `4F 42 1A 00 …` | ACK for binary packet (translation frame) | `notifyAck()` |
+| `45 4D 68 00` | Glasses "truly ready" signal — expected after full pairing cycle | Log only (not yet observed in tests) |
+| `45 4D 10 00 02 00 04 00 19 00` | Unknown; appears ~24 s in, 7 s before disconnect | Reply `CMD_CONFIRMATION` |
+| `45 4D 15 00 …` | IMU data | Ignored |
+| `45 4D CE 00 02 00 04 00 03 00/01` | Unknown; appears after pairing commands | Logged only |
+| `45 4D C7 00 01 00 02 00 01` | Unknown; appears after `longPressConfirmResponse` | Logged only |
+| `45 4D 2F 00 01 00 02 00 00` | Mic stop (`0x002F`) | Logged only |
+| `01` (single byte) | Glasses requesting long-press flow | Send `CMD_GLASS_LONG_PRESS` |
+
+---
+
+## Current Fix (status: untested as of last push)
+
+After enabling TX notifications post-pairing, the `onTX` handler now correctly
+implements the glasses' state machine:
+
+1. **TX `[0x01]`** (post-ready) → send only `CMD_GLASS_LONG_PRESS`
+2. **`longPressConfirmResponse`** (`4F 42 00 00 01 00 02 00 00`) → send
+   `CMD_APP_SHOW_PAIR + CMD_DIRECT_PAIR + CMD_CONFIRMATION`
+3. **`45 4D 68 00`** → log "glasses signaled ready!" (this should now appear
+   and confirm the full pairing cycle completed)
+
+The hypothesis is that responding properly to `longPressConfirmResponse` will
+cause the glasses to send `45 4D 68 00` and stop the 30-second timer.
+
+In direct-pair mode (`needPair = false` on iOS), the glasses are expected to
+send `longPressConfirmResponse` **automatically** without requiring a second
+physical long-press from the user (confirmed by user: iOS never needs a second
+long-press).
 
 ---
 
 ## Next Steps if Current Fix Fails
 
-1. **Share the new log** after the `CMD_CONFIRMATION` response attempt — check
-   whether the `0x0010` message is acknowledged or if the disconnect timing
-   changes.
-2. **Try echoing the exact bytes** back to the glasses as a generic keepalive
-   response.
-3. **Inspect the iOS app** source code (not just the SDK) to find how
-   `onTxValueReceived` handles cmdType `0x0010`.
-4. **Ask the glasses firmware team** what `0x0010` expects as a response and
-   what `payload[0] = 0x19` (25) represents (possibly a countdown or session ID).
+1. Check whether `TX: 45 4D 68 00 — glasses signaled ready!` appears in the log.
+   If yes but still disconnects → the 30-second timer is triggered by something
+   else entirely.
+2. Check timing of disconnect: if it shifts from 30.8 s after "Glasses ready!"
+   to 30.8 s after something else → that new anchor point is the real trigger.
+3. **Ask the firmware/iOS app team** what the `45 4D CE 00` and `45 4D C7 00`
+   messages mean, and whether the host is expected to respond to them.
+4. Investigate whether the `MGG09B…` serial number in the `CMD_DIRECT_PAIR` ACK
+   payload needs to be stored and echoed back in subsequent commands.

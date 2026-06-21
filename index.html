@@ -229,20 +229,33 @@ async function connect() {
     await new Promise(r => setTimeout(r, 500));
     const service = await server.getPrimaryService(SERVICE_UUID);
 
+    log('Getting write characteristic…');
     writeChar       = await service.getCharacteristic(WRITE_UUID);
+    log('Getting TX characteristic…');
     const txChar    = await service.getCharacteristic(TX_UUID);
+    log('Getting handshake characteristic…');
     const hsChar    = await service.getCharacteristic(HANDSHAKE_UUID);
+    log(`HS properties: ${JSON.stringify(hsChar.properties)}`);
 
     // Listen on TX for ACKs and pairing events
+    log('Starting TX notifications…');
     await txChar.startNotifications();
     txChar.addEventListener('characteristicvaluechanged', onTX);
 
     // ── Phase 1: token handshake ──
-    log('Starting handshake…');
-    await hsChar.writeValueWithResponse(HANDSHAKE_TOKEN);
+    log('Writing handshake token…');
+    try {
+      await hsChar.writeValueWithResponse(HANDSHAKE_TOKEN);
+    } catch(e) {
+      log(`writeValueWithResponse failed (${e.message}), trying withoutResponse…`);
+      await hsChar.writeValueWithoutResponse(HANDSHAKE_TOKEN);
+    }
+    log('Handshake token sent, waiting…');
     await new Promise(r => setTimeout(r, 250));
+    log('Reading handshake response…');
     const hsVal = await hsChar.readValue();
     const hsBytes = new Uint8Array(hsVal.buffer);
+    log(`HS response: len=${hsBytes.length} b0=0x${hsBytes[0]?.toString(16)}`);
 
     if (hsBytes.length !== 18 || hsBytes[0] !== 0x64) {
       throw new Error(`Handshake failed (len=${hsBytes.length}, b0=0x${hsBytes[0]?.toString(16)})`);

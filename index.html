@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AiLens BLE Demo</title>
+  <style>
+    body { font-family: sans-serif; max-width: 500px; margin: 40px auto; padding: 0 20px; }
+    button { padding: 10px 20px; font-size: 16px; margin: 6px 4px; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    #log { margin-top: 20px; background: #f4f4f4; padding: 12px; border-radius: 6px;
+           font-family: monospace; font-size: 13px; white-space: pre-wrap; min-height: 80px; }
+    .ok  { color: green; }
+    .err { color: red; }
+  </style>
+</head>
+<body>
+  <h2>AiLens BLE Demo</h2>
+  <button id="btnConnect">Scan &amp; Connect</button>
+  <button id="btnHello" disabled>Write "Hello, world"</button>
+  <button id="btnDisconnect" disabled>Disconnect</button>
+  <div id="log">Ready.</div>
+
+<script>
+// ── UUIDs ──────────────────────────────────────────────────────────────────
+const SERVICE_UUID    = '00010000-0000-1000-8000-00805f9b5a6b';
+const WRITE_UUID      = '00010001-0000-1000-8000-00805f9b5a6b'; // host → device
+const TX_UUID         = '00010002-0000-1000-8000-00805f9b5a6b'; // device → host (notify)
+const HANDSHAKE_UUID  = '00010003-0000-1000-8000-00805f9b5a6b';
+
+// ── CRC-32 (ported directly from CRC.swift / metaCRC32) ───────────────────
+const CRC_TABLE = new Uint32Array([
+  0,517762881,1035525762,593801667,2071051524,1705890373,1187603334,1477774535,
+  4142103048,3896448329,3411780746,3582446539,2375206668,2471405645,2955549070,2935387855,
+  4078607185,3989238800,3466741203,3497929362,2288723541,2528052116,3044567895,2869925990,
+  100262233,455446040,943800283,647843994,2122865757,1616130844,1127252703,1575808414,
+  4176042467,3862246274,3310454625,3683510304,2207835367,2638514410,3150782341,1700891428,
+  235545579,282479786,867368297,762221096,1971035887,1806168494,1220755565,1444884268,
+  200524466,355446259,910892080,681014129,1887600566,1851658487,1295687988,1407635061,
+  4245731514,3821852667,3257262392,3732098553,2254609397,2562654212,3101930127,1619527543, // note: will fix with actual table
+]);
+
+// Build the real table from the Swift literal (signed → unsigned via >>> 0)
+const RAW = [
+  0,517762881,1035525762,593801667,2071051524,1705890373,1187603334,1477774535,
+  -152864248,-398518967,-883186550,-712520757,-1919760628,-1823561651,-1339418226,-1359579441,
+  -216360111,-305728496,-828226093,-797037934,-2006243755,-1766373100,-1244399401,-1425041514,
+  100262233,455446040,943800283,647843994,2122865757,1616130844,1127252703,1575808414,
+  -118924829,-432720222,-984512671,-611456992,-2087131929,-1656452186,-1105184155,-1594075868,
+  235545579,282479786,867368297,762221096,1971035887,1806168494,1220755565,1444884268,
+  200524466,355446259,910892080,681014129,1887600566,1851658487,1295687988,1407635061,
+  -49235782,-473114629,-1062705608,-562820743,-2040461890,-1732416769,-1143350468,-1526352771,
+  -284238713,-237849658,-759823867,-865440444,-1803591293,-1969025342,-1446527231,-1222913984,
+  435005071,120703438,609581069,982062924,1654397835,2084598986,1596245257,1106815560,
+  471091158,46672023,564959572,1064367637,1734736594,2042205587,1524442192,1140935441,
+  -352895522,-198487393,-682630308,-913077219,-1853456166,-1889865829,-1405198760,-1293799143,
+  401048932,154921509,710892518,881013927,1821784160,1917474593,1362028258,1341295011,
+  -519766164,-2584531,-591650322,-1033875793,-1703591320,-2069287639,-1479697174,-1190005845,
+  -453173707,-98471564,-649740105,-946229258,-1618173135,-2125411216,-1573618253,-1125641486,
+  303981629,214043516,799455935,830133758,1768937785,2008266360,1423378363,1242261754,
+  -1061038513,-568477426,-42399539,-475699316,-1146066101,-1519647734,-2046249527,-1730880888,
+  908241991,687784710,194671301,356916612,1297289539,1401912834,1894502337,1849139328,
+  870010142,755442271,241406876,281017565,1219162138,1450614619,1964125848,1808679385,
+  -986171626,-605792169,-125769324,-430143787,-1102476782,-1600789165,-2081336176,-1657979951,
+  942182316,653582573,93344046,457981551,1129919144,1569021417,2128735274,1614644075,
+  -825494108,-803759387,-210556122,-307280793,-1246082912,-1419368479,-2013096414,-1763772061,
+  -885910275,-705791044,-158676353,-396974786,-1337742855,-1365260616,-1912899717,-1826154438,
+  1037135605,588054964,6926455,515235638,1184945137,1484569776,2065173875,1707369010,
+  802097864,823354761,309843018,212581131,1421785036,1247991949,1762027854,2010777103,
+  -651398976,-940564607,-460018110,-95895293,-1570910780,-1132354939,-1612377274,-2126939129,
+  -589983335,-1039532328,-512930021,-5169062,-1482412899,-1183300644,-1709379041,-2067751586,
+  708242321,887784656,395195667,156392018,1363629717,1335572948,1828685847,1914955606,
+  -685354197,-906347414,-358707799,-196943128,-1403523537,-1299480210,-1846595411,-1892458516,
+  566569251,1058621026,478017441,44144864,1521783847,1147730790,1728858789,2043684324,
+  607963258,987801403,428087032,123238841,1598911870,1100028479,1660267516,2083112125,
+  -757091726,-872161997,-278434576,-239402063,-1448210570,-1217241033,-1810443788,-1966424395,
+];
+
+const CRC32_TABLE = new Uint32Array(RAW.map(v => v >>> 0));
+
+function metaCRC32(bytes, init = 0) {
+  let crc = init >>> 0;
+  for (const b of bytes) {
+    const idx = ((b ^ (crc >>> 24)) & 0xFF);
+    crc = ((crc << 8) ^ CRC32_TABLE[idx]) >>> 0;
+  }
+  return crc;
+}
+
+// ── Little-endian helpers ──────────────────────────────────────────────────
+function u16le(v) { return [v & 0xFF, (v >> 8) & 0xFF]; }
+function u32le(v) { v = v >>> 0; return [v & 0xFF, (v>>8)&0xFF, (v>>16)&0xFF, (v>>24)&0xFF]; }
+
+// ── Draw command packet builder ────────────────────────────────────────────
+// Mirrors getData() in DrawTextCommand.swift
+function buildDrawPacket(innerPayload) {
+  // innerPayload = the bytes after the 0x60 wrapper (type + params + text)
+  const payloadInnerLen = innerPayload.length;
+
+  // wrapped payload: [0x60, len_lo, len_hi, ...innerPayload]
+  const payload = [0x60, ...u16le(payloadInnerLen), ...innerPayload];
+
+  // crc2 = CRC32 of payload
+  const crc2 = metaCRC32(payload);
+
+  // CommData Head: [0x50, payload_len(4), crc2(4), 0x00×16]
+  const commDataHead = [0x50, ...u32le(payload.length), ...u32le(crc2), ...new Array(16).fill(0)];
+
+  // crc1 = CRC32 of (commDataHead + payload)
+  const crc1 = metaCRC32([...commDataHead, ...payload]);
+
+  // Request Head: [0x50, 0x00, crc1(4), 0x00×4]
+  const requestHead = [0x50, 0x00, ...u32le(crc1), 0x00, 0x00, 0x00, 0x00];
+
+  const len = requestHead.length + commDataHead.length + payload.length;
+
+  // CMD Header: [0x45, 0x4D, 0x1A, 0x00, len_lo, len_hi, (len*2)_lo, (len*2)_hi]
+  const cmdHead = [0x45, 0x4D, 0x1A, 0x00, ...u16le(len), ...u16le(len * 2)];
+
+  return new Uint8Array([...cmdHead, ...requestHead, ...commDataHead, ...payload]);
+}
+
+function buildDrawText(text, x, y, width, height, textSize) {
+  const textBytes = new TextEncoder().encode(text);
+  const inner = [
+    0x01,                    // type = text
+    ...u16le(textSize),
+    ...u16le(x),
+    ...u16le(y),
+    ...u16le(width),
+    ...u16le(height),
+    ...textBytes,
+  ];
+  return buildDrawPacket(inner);
+}
+
+// ── Raw fixed commands ─────────────────────────────────────────────────────
+const CMD_OPEN_CANVAS  = new Uint8Array([0x45,0x4D,0x79,0x00,0x00,0x00,0x00,0x00]);
+const CMD_CLOSE_CANVAS = new Uint8Array([0x45,0x4D,0x7A,0x00,0x00,0x00,0x00,0x00]);
+const CMD_DISCONNECT   = new Uint8Array([0x45,0x4D,0x73,0x00,0x00,0x00,0x00,0x00]);
+
+// Handshake / pairing raw commands
+const CMD_GLASS_LONG_PRESS = new Uint8Array([0x45,0x4D,0x00,0x00,0x00,0x00,0x00,0x00]);
+const CMD_APP_SHOW_PAIR    = new Uint8Array([0x45,0x4D,0x67,0x00,0x01,0x00,0x02,0x00,0x01]);
+const CMD_DIRECT_PAIR      = new Uint8Array([0x45,0x4D,0x0C,0x01,0x00,0x00,0x00,0x00]);
+const CMD_CONFIRMATION     = new Uint8Array([0x45,0x4D,0x69,0x00,0x01,0x00,0x02,0x00,0x01]);
+const HANDSHAKE_TOKEN      = new Uint8Array([
+  0xA4,0x6A,0xD6,0xE0,0x35,0x82,0x00,0x00,
+  0x10,0x01,0xC0,0xEF,0x1A,0x03,0x2B,0xA8,
+  0x40,0x14,0x87,0x30,0x1C,0xB8,0xA5,0x61,
+  0xEC,0x77,0x8D,
+]);
+
+// ── State ──────────────────────────────────────────────────────────────────
+let device = null, writeChar = null;
+
+// ── Command queue with ACK waiting ─────────────────────────────────────────
+// After each draw packet the glasses ACK on TX (starts with 0x4F 0x42).
+// We gate the next send behind a promise that resolves on ACK (or 300 ms timeout).
+let ackResolve = null;
+
+function notifyAck() { if (ackResolve) { ackResolve(); ackResolve = null; } }
+
+function waitForAck(ms = 300) {
+  return new Promise(resolve => {
+    ackResolve = resolve;
+    setTimeout(() => { if (ackResolve) { ackResolve = null; resolve(); } }, ms);
+  });
+}
+
+async function sendCmd(bytes) {
+  if (!writeChar) throw new Error('Not connected');
+  await writeChar.writeValueWithoutResponse(bytes);
+  await waitForAck();
+}
+
+// ── Logging ────────────────────────────────────────────────────────────────
+const logEl = document.getElementById('log');
+function log(msg, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ── UI buttons ─────────────────────────────────────────────────────────────
+const btnConnect    = document.getElementById('btnConnect');
+const btnHello      = document.getElementById('btnHello');
+const btnDisconnect = document.getElementById('btnDisconnect');
+
+btnConnect.addEventListener('click', connect);
+btnHello.addEventListener('click', writeHello);
+btnDisconnect.addEventListener('click', disconnect);
+
+// ── Connect & handshake ────────────────────────────────────────────────────
+async function connect() {
+  try {
+    btnConnect.disabled = true;
+    log('Scanning for AiLens devices…');
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'AiLens' }],
+      optionalServices: [SERVICE_UUID],
+    });
+    log(`Found: ${device.name}`);
+
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    log('Connecting to GATT…');
+    const server  = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+
+    writeChar       = await service.getCharacteristic(WRITE_UUID);
+    const txChar    = await service.getCharacteristic(TX_UUID);
+    const hsChar    = await service.getCharacteristic(HANDSHAKE_UUID);
+
+    // Listen on TX for ACKs and pairing events
+    await txChar.startNotifications();
+    txChar.addEventListener('characteristicvaluechanged', onTX);
+
+    // ── Phase 1: token handshake ──
+    log('Starting handshake…');
+    await hsChar.writeValueWithoutResponse(HANDSHAKE_TOKEN);
+    await new Promise(r => setTimeout(r, 250));
+    const hsVal = await hsChar.readValue();
+    const hsBytes = new Uint8Array(hsVal.buffer);
+
+    if (hsBytes.length !== 18 || hsBytes[0] !== 0x64) {
+      throw new Error(`Handshake failed (len=${hsBytes.length}, b0=0x${hsBytes[0]?.toString(16)})`);
+    }
+    log('Handshake OK — waiting for pairing prompt on glasses…', 'ok');
+    log('(Long-press the glasses button if prompted)');
+
+    // Phase 2 & 3 continue in onTX()
+
+  } catch (e) {
+    log(`Error: ${e.message}`, 'err');
+    btnConnect.disabled = false;
+  }
+}
+
+// ── TX notification handler (pairing state machine + ACK) ─────────────────
+async function onTX(event) {
+  const data  = new Uint8Array(event.target.value.buffer);
+  const hex   = [...data].map(b => b.toString(16).padStart(2,'0')).join(' ');
+
+  // ACK: starts with 4F 42
+  if (data[0] === 0x4F && data[1] === 0x42) {
+    notifyAck();
+    return;
+  }
+
+  // Pairing step 1: single byte 0x01 → send long-press command
+  if (data.length === 1 && data[0] === 0x01) {
+    log('TX: long-press prompt → sending response');
+    await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
+    return;
+  }
+
+  // Pairing step 2: longPressConfirmResponse  4F 42 00 00 01 00 02 00 00
+  if (data.length === 9 && data[0]===0x4F && data[1]===0x42 && data[8]===0x00) {
+    log('TX: long-press confirmed → sending pair commands');
+    await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
+    await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
+    await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
+    return;
+  }
+
+  // Ready: starts with 45 4D 68 00
+  if (data[0]===0x45 && data[1]===0x4D && data[2]===0x68 && data[3]===0x00) {
+    log('Glasses ready!', 'ok');
+    btnHello.disabled      = false;
+    btnDisconnect.disabled = false;
+    btnConnect.disabled    = true;
+    return;
+  }
+
+  // IMU data: starts with 45 4D 15 00
+  if (data[0]===0x45 && data[1]===0x4D && data[2]===0x15 && data[3]===0x00) {
+    return; // ignore for this demo
+  }
+
+  log(`TX: ${hex}`);
+}
+
+// ── Write "Hello, world" ───────────────────────────────────────────────────
+async function writeHello() {
+  try {
+    btnHello.disabled = true;
+    log('Sending Hello, world…');
+
+    await sendCmd(CMD_OPEN_CANVAS);
+    log('Canvas opened');
+
+    const drawPacket = buildDrawText('Hello, world', 0, 0, 640, 60, 30);
+    await sendCmd(drawPacket);
+    log('Text sent', 'ok');
+
+    // Keep visible for 3 seconds, then clear
+    await new Promise(r => setTimeout(r, 3000));
+    await sendCmd(CMD_CLOSE_CANVAS);
+    log('Canvas closed');
+
+  } catch (e) {
+    log(`Error: ${e.message}`, 'err');
+  } finally {
+    btnHello.disabled = false;
+  }
+}
+
+// ── Disconnect ─────────────────────────────────────────────────────────────
+async function disconnect() {
+  try {
+    if (writeChar) await writeChar.writeValueWithoutResponse(CMD_DISCONNECT);
+    device?.gatt.disconnect();
+  } catch (_) {}
+  onDisconnected();
+}
+
+function onDisconnected() {
+  log('Disconnected');
+  writeChar = null;
+  device    = null;
+  ackResolve = null;
+  btnConnect.disabled    = false;
+  btnHello.disabled      = true;
+  btnDisconnect.disabled = true;
+}
+</script>
+</body>
+</html>

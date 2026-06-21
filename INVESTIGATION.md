@@ -233,37 +233,90 @@ popup, both transports connect at once and the glasses' timer clears.
 
 ## Options to Resolve
 
-### Option 1: Host-initiated CMD_PAIR_STATE_SYNC (pending test)
+---
 
-Commit `05efa72` sends `45 4D 68 00 01 00 02 00 01` (CMD_PAIR_STATE_SYNC REQ
-with status=1) from the host. Per §4.103 the glasses send this REQ after Classic
-BT pairs and the host responds. If the firmware also accepts it from the host,
-it might signal "pairing complete" and clear the timer.
+## All BLE-Only Approaches Exhausted (2026-06-22)
 
-**Watch for**: glasses responding with `4F 42 68 00 ...` (CMD_PAIR_STATE_SYNC RSP)
-and `connectStatus` becoming `true` in subsequent BT status polls.
+### Definitive proof: the "pi-pon" sound
 
-### Option 2: Pre-pair Classic BT via Windows Settings
+When the glasses connect to an iPhone or Android phone they play a **"pi-pon"
+connection sound** through their own speaker. This sound is transmitted via
+the **HFP (Hands-Free Profile) Classic BT audio channel** — it is not possible
+over BLE. The glasses play this sound at the exact moment Classic BT audio
+connects, which is the same moment they send `45 4D 68 00 ... 01` and clear
+the 30-second timer.
 
-Before opening Chrome:
-1. Boot the glasses into pairing mode (long-press or fresh boot)
-2. Windows Settings → Bluetooth → Add a device → pair the glasses as a Classic BT device
-3. Open Chrome and run the web demo
+On Windows there is no "pi-pon". Classic BT audio never connects. The 30-second
+timer always fires.
 
-With Classic BT already paired, `addressSaved=true` and possibly
-`connectStatus=true` when BT status polling starts, clearing the timer
-immediately.
+### Complete causal chain
 
-**Challenge**: timing — the glasses may leave pairing mode before the web demo
-connects, or BLE pairing and Classic BT pairing may conflict.
+```
+Phone (iOS/Android)          Glasses firmware
+─────────────────────────────────────────────────────────
+CMD_APP_SHOW_PAIR ──────────► advertise for Classic BT
+                              Classic BT audio (HFP) connects
+                              ♪ pi-pon ♪  (via HFP audio channel)
+                              connectStatus ← 1
+                 ◄─────────── 45 4D 68 00 ... 01  (CMD_PAIR_STATE_SYNC REQ)
+CMD_CONNECT_SUCCEED ─────────►
+BT status poll ─────────────► connectStatus = 1
+                              30-second timer cleared
+```
 
-### Option 3: Electron app
+Chrome Web Bluetooth cannot trigger any step on the Glasses column above.
 
-Replace the Chrome web demo with an Electron app. Node.js can use native
-Bluetooth bindings (`noble`, `@abandonware/bluetooth-hci-socket`) to access
-both BLE and Classic BT, fully replicating mobile app behavior.
+### Host-initiated CMD_PAIR_SYNC_SUCCESS: did not work
 
-### Option 4: Firmware BLE-only mode (requires ThinkAR)
+Commit `05efa72` sent `45 4D 68 00 01 00 02 00 01` from the host.
+Glasses ignored it — still disconnected at ~29 s. The firmware only accepts
+`CMD_PAIR_STATE_SYNC` REQ as a notification it sends to the host, not the
+reverse.
 
-Ask ThinkAR to add a firmware command that skips the Classic BT pairing
-requirement. This is the cleanest long-term fix but requires vendor cooperation.
+### Pre-pairing Classic BT via Windows Settings: causes cycling
+
+Attempting to pair the glasses as a Classic BT device via Windows Settings
+while a BLE session is active causes the glasses to alternate between the
+"pairing page" and the "BLE disconnected page" in a loop.
+
+**Why**: the glasses firmware expects BLE and Classic BT to pair simultaneously
+(coordinated by a phone's Bluetooth stack in one combined popup). When they
+arrive as separate events from two independent Windows subsystems, the firmware
+state machine enters an inconsistent state and resets the BLE connection.
+
+---
+
+## Conclusion: Fundamental Platform Limitation
+
+The web demo **cannot maintain a connection on Windows Chrome** without
+architectural changes. This is not a protocol bug — it is a hard platform
+constraint:
+
+| Requirement | Web Bluetooth | Chrome on Windows |
+|---|---|---|
+| BLE GATT (commands, display) | ✓ Supported | ✓ Works |
+| Classic BT audio (HFP, "pi-pon") | ✗ Not in spec | ✗ Impossible |
+
+---
+
+## Remaining Options
+
+### Option 1: Electron app (recommended for Windows)
+
+Replace the Chrome web demo with an Electron app. Node.js native Bluetooth
+bindings (`@abandonware/noble` for BLE + WinRT or `node-bluetooth` for Classic
+BT HFP) can replicate the full phone Bluetooth stack, triggering the "pi-pon"
+and clearing the timer.
+
+### Option 2: Firmware BLE-only mode (requires ThinkAR)
+
+Ask ThinkAR to add a firmware flag or command that makes the glasses skip the
+Classic BT audio requirement. With this, `connectStatus` would not be needed
+and the 30-second timer would not apply. This is the cleanest fix but requires
+firmware changes from the vendor.
+
+### Option 3: Web demo only for iOS/Android
+
+Accept the Windows limitation. Add a clear message in the web demo UI when
+running on Windows (detected via `navigator.userAgent`) explaining that a
+native app is required. The demo continues to work correctly on iOS and Android.

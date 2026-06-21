@@ -269,7 +269,7 @@ async function connect() {
     const hsBytes = new Uint8Array(hsVal.buffer);
     log(`HS response: len=${hsBytes.length} b0=0x${hsBytes[0]?.toString(16)}`);
 
-    if (hsBytes.length !== 18 || hsBytes[0] !== 0x64) {
+    if (hsBytes.length !== 18 || ![0x64, 0x65, 0x66].includes(hsBytes[0])) {
       throw new Error(`Handshake failed (len=${hsBytes.length}, b0=0x${hsBytes[0]?.toString(16)})`);
     }
     log('Handshake OK', 'ok');

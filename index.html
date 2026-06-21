@@ -239,7 +239,7 @@ async function connect() {
 
     // ── Phase 1: token handshake ──
     log('Starting handshake…');
-    await hsChar.writeValueWithoutResponse(HANDSHAKE_TOKEN);
+    await hsChar.writeValueWithResponse(HANDSHAKE_TOKEN);
     await new Promise(r => setTimeout(r, 250));
     const hsVal = await hsChar.readValue();
     const hsBytes = new Uint8Array(hsVal.buffer);

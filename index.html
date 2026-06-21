@@ -199,9 +199,13 @@ async function connect() {
     log('Scanning for AiLens devices…');
 
     device = await navigator.bluetooth.requestDevice({
-      filters: [{ namePrefix: 'Ai Lens' }],
+      acceptAllDevices: true,
       optionalServices: [SERVICE_UUID],
     });
+    if (!device.name?.includes('Ai Lens')) {
+      device.gatt.disconnect();
+      throw new Error(`Selected device "${device.name}" is not an Ai Lens device`);
+    }
     log(`Found: ${device.name}`);
 
     device.addEventListener('gattserverdisconnected', onDisconnected);

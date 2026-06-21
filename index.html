@@ -336,48 +336,72 @@ async function connect() {
 }
 
 // ── TX handler ─────────────────────────────────────────────────────────────
+// Deduplicate: Chrome/Windows fires each BLE notification twice.
+let _lastTxHex = '', _lastTxMs = 0;
+
 async function onTX(event) {
   const data = new Uint8Array(event.target.value.buffer);
   const hex  = [...data].map(b => b.toString(16).padStart(2,'0')).join(' ');
 
+  // Drop exact duplicates that arrive within 200 ms of each other.
+  const now = Date.now();
+  if (hex === _lastTxHex && now - _lastTxMs < 200) return;
+  _lastTxHex = hex; _lastTxMs = now;
+
+  // ── 4F 42 … — ACK family ────────────────────────────────────────────────
   if (data[0] === 0x4F && data[1] === 0x42) {
+    // longPressConfirmResponse = 4F 42 00 00 01 00 02 00 00 (9 bytes)
+    // iOS SDK responds to this with APP_SHOW_PAIR + DIRECT_PAIR + CONFIRMATION.
+    if (data.length === 9 &&
+        data[2]===0x00 && data[3]===0x00 && data[4]===0x01 &&
+        data[5]===0x00 && data[6]===0x02 && data[7]===0x00 && data[8]===0x00) {
+      log(`TX longPressConfirmResponse: ${hex}`);
+      if (isReady && writeChar) {
+        log('Sending post-confirm pairing (APP_SHOW_PAIR + DIRECT_PAIR + CONFIRMATION)…');
+        (async () => {
+          await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
+          await new Promise(r => setTimeout(r, 200));
+          await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
+          await new Promise(r => setTimeout(r, 200));
+          await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
+        })().catch(e => log(`Post-confirm error: ${e.message}`, 'err'));
+      }
+      return;
+    }
     log(`TX ACK: ${hex}`);
     notifyAck();
     return;
   }
-  if (data[0] === 0x45 && data[1] === 0x4D && data[2] === 0x15 && data[3] === 0x00) {
-    log('TX IMU (ignored)');
-    return;
-  }
-  // cmdType 0x0010 — logged for investigation; reply with CMD_CONFIRMATION.
-  if (data[0] === 0x45 && data[1] === 0x4D && data[2] === 0x10 && data[3] === 0x00) {
-    log(`TX 0x0010: ${hex} — replying with CMD_CONFIRMATION`);
-    if (writeChar) {
-      writeChar.writeValueWithoutResponse(CMD_CONFIRMATION)
-        .catch(e => log(`0x0010 reply error: ${e.message}`, 'err'));
+
+  // ── 45 4D … — glasses-originated EM frames ──────────────────────────────
+  if (data[0] === 0x45 && data[1] === 0x4D) {
+    if (data[2] === 0x68 && data[3] === 0x00) {
+      log(`TX: 45 4D 68 00 — glasses signaled ready!`, 'ok');
+      return;
     }
-    return;
+    if (data[2] === 0x15 && data[3] === 0x00) { return; } // IMU, ignore silently
+    if (data[2] === 0x10 && data[3] === 0x00) {
+      log(`TX 0x0010: ${hex} — replying with CMD_CONFIRMATION`);
+      if (writeChar) writeChar.writeValueWithoutResponse(CMD_CONFIRMATION)
+        .catch(e => log(`0x0010 reply error: ${e.message}`, 'err'));
+      return;
+    }
   }
-  // TX [0x01]: glasses requesting long-press flow.
-  // After pairing (isReady), TX notifications are working so respond automatically
-  // with the full pairing sequence — physical long-press already done in round 1.
+
+  // ── TX [0x01] — glasses requesting long-press ────────────────────────────
+  // iOS SDK responds with CMD_GLASS_LONG_PRESS only; then waits for
+  // longPressConfirmResponse before sending the remaining pairing commands.
   if (data.length === 1 && data[0] === 0x01) {
     if (isReady && writeChar) {
-      log('TX: 01 — post-ready long-press request, responding automatically');
-      (async () => {
-        await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
-        await new Promise(r => setTimeout(r, 300));
-        await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
-        await new Promise(r => setTimeout(r, 200));
-        await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
-        await new Promise(r => setTimeout(r, 200));
-        await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
-      })().catch(e => log(`Auto re-pair error: ${e.message}`, 'err'));
+      log('TX: 01 — sending CMD_GLASS_LONG_PRESS (awaiting longPressConfirmResponse)');
+      writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS)
+        .catch(e => log(`CMD_GLASS_LONG_PRESS error: ${e.message}`, 'err'));
     } else {
       log('TX: 01 (during initial pairing)');
     }
     return;
   }
+
   log(`TX: ${hex}`);
 }
 

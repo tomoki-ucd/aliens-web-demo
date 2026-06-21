@@ -149,11 +149,15 @@ function buildTranslationFrames(sessionId, original, translation, mtu = 185) {
 // ── Raw fixed commands ─────────────────────────────────────────────────────
 const CMD_DISCONNECT         = new Uint8Array([0x45,0x4D,0x73,0x00,0x00,0x00,0x00,0x00]);
 const CMD_GLASS_LONG_PRESS   = new Uint8Array([0x45,0x4D,0x00,0x00,0x00,0x00,0x00,0x00]);
+// CMD_SET_PHONE_TYPE (0x67) REQ — payload: type byte. iOS=0x01, Android=0x0A (protocol manual §4.102)
 const CMD_APP_SHOW_PAIR      = new Uint8Array([0x45,0x4D,0x67,0x00,0x01,0x00,0x02,0x00,0x01]);
 // connectSucceedResponseCommand from iOS SDK — sent in response to 45 4D 68 00 ... 01
 const CMD_CONNECT_SUCCEED    = new Uint8Array([0x4F,0x42,0x68,0x00,0x00,0x00,0x00,0x00]);
 // reportBluetoothStatusCommand from iOS SDK — polled every 1 s to keep connection alive
 const CMD_BT_STATUS_POLL     = new Uint8Array([0x45,0x4D,0x3A,0x00,0x00,0x00,0x00,0x00]);
+// CMD_BTCONNECT_BACK_ENABLE (0x39) with value=0: disable BT auto-reconnect (protocol manual §4.57)
+// Sent after handshake to prevent the glasses from requiring Classic BT within 30 s.
+const CMD_BT_RECONNECT_OFF   = new Uint8Array([0x45,0x4D,0x39,0x00,0x01,0x00,0x02,0x00,0x00]);
 const HANDSHAKE_TOKEN      = new Uint8Array([
   0xA4,0x6A,0xD6,0xE0,0x35,0x82,0x00,0x00,
   0x10,0x01,0xC0,0xEF,0x1A,0x03,0x2B,0xA8,
@@ -314,6 +318,13 @@ async function connect() {
     }
     log('Handshake OK', 'ok');
 
+    // Disable BT auto-reconnect (§4.57 CMD_BTCONNECT_BACK_ENABLE = 0).
+    // Hypothesis: this prevents the glasses from requiring Classic BT to connect
+    // within the 30-second pairing window and then disconnecting BLE.
+    log('Sending CMD_BT_RECONNECT_OFF (disable BT auto-reconnect)…');
+    await writeChar.writeValueWithoutResponse(CMD_BT_RECONNECT_OFF);
+    await new Promise(r => setTimeout(r, 100));
+
     // Phase 2: pairing — requires physical long-press on the glasses touch bar.
     // TX notifications are unavailable on Windows, so we can't detect the long-press
     // automatically. Show a button and wait for the user to confirm.
@@ -367,14 +378,15 @@ async function onTX(event) {
   if (data[0] === 0x4F && data[1] === 0x42) {
 
     // BT status response (4F 42 3A 00 ..., ≥11 bytes) — reply to CMD_BT_STATUS_POLL
-    // Last byte = 0x01 means connection successful (BLE and/or Classic BT confirmed).
+    // Protocol manual §4.58: RSP payload = status + addressSaved + connectStatus
+    // addressSaved=1 means Classic BT address saved; connectStatus=1 means Classic BT connected.
     if (data[2] === 0x3A && data[3] === 0x00 && data.length >= 11) {
-      const result    = data[8];
-      const bonded    = data[data.length - 2] === 0x01;
-      const connected = data[data.length - 1] === 0x01;
-      log(`TX BT status: result=0x${result.toString(16)} bonded=${bonded} connected=${connected} [${hex}]`);
-      if (connected) {
-        log('Connection confirmed (BT status last byte=0x01)', 'ok');
+      const result        = data[8];
+      const addressSaved  = data[data.length - 2] === 0x01;
+      const connectStatus = data[data.length - 1] === 0x01;
+      log(`TX BT status: result=0x${result.toString(16)} addressSaved=${addressSaved} connectStatus=${connectStatus} [${hex}]`);
+      if (connectStatus) {
+        log('Classic BT connected (connectStatus=1) — connection fully confirmed', 'ok');
         stopBtStatusPolling();
         if (!isReady) {
           isReady = true;

@@ -235,11 +235,21 @@ async function connect() {
     const txChar    = await service.getCharacteristic(TX_UUID);
     log('Getting handshake characteristic…');
     const hsChar    = await service.getCharacteristic(HANDSHAKE_UUID);
-    log(`HS properties: ${JSON.stringify(hsChar.properties)}`);
+
+    // Log actual properties
+    const txProps = txChar.properties;
+    const hsProps = hsChar.properties;
+    log(`TX properties: notify=${txProps.notify} indicate=${txProps.indicate} write=${txProps.write} writeWithoutResponse=${txProps.writeWithoutResponse}`);
+    log(`HS properties: notify=${hsProps.notify} indicate=${hsProps.indicate} write=${hsProps.write} writeWithoutResponse=${hsProps.writeWithoutResponse}`);
 
     // Listen on TX for ACKs and pairing events
     log('Starting TX notifications…');
-    await txChar.startNotifications();
+    try {
+      await txChar.startNotifications();
+      log('TX notifications started');
+    } catch(e) {
+      log(`TX startNotifications failed: ${e.message} — continuing anyway`);
+    }
     txChar.addEventListener('characteristicvaluechanged', onTX);
 
     // ── Phase 1: token handshake ──

@@ -177,9 +177,13 @@ function waitForAck(ms = 1000) {
 // ── Logging ────────────────────────────────────────────────────────────────
 const logEl = document.getElementById('log');
 function log(msg, cls) {
+  const ts = new Date().toLocaleTimeString('en-US', {
+    hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit',
+    fractionalSecondDigits: 1,
+  });
   const line = document.createElement('div');
   if (cls) line.className = cls;
-  line.textContent = msg;
+  line.textContent = `[${ts}] ${msg}`;
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
 }
@@ -255,13 +259,16 @@ async function connect() {
     log('Writing handshake token…');
     try {
       await hsChar.writeValueWithResponse(HANDSHAKE_TOKEN);
+      log('Handshake write: withResponse OK');
     } catch(e) {
+      log(`Handshake write: withResponse failed (${e.message}), trying withoutResponse`);
       await hsChar.writeValueWithoutResponse(HANDSHAKE_TOKEN);
     }
     await new Promise(r => setTimeout(r, 250));
     const hsVal   = await hsChar.readValue();
     const hsBytes = new Uint8Array(hsVal.buffer);
-    log(`Handshake response: len=${hsBytes.length} b0=0x${hsBytes[0]?.toString(16)}`);
+    const hsHex   = [...hsBytes].map(b => b.toString(16).padStart(2,'0')).join(' ');
+    log(`Handshake response (${hsBytes.length} bytes): ${hsHex}`);
 
     if (hsBytes.length !== 18 || ![0x64, 0x65, 0x66].includes(hsBytes[0])) {
       throw new Error(`Handshake failed (b0=0x${hsBytes[0]?.toString(16)})`);
@@ -269,13 +276,16 @@ async function connect() {
     log('Handshake OK', 'ok');
 
     // Phase 2: proactive pairing (TX notify not reliable on Windows)
-    log('Sending pairing commands…');
+    log('Sending CMD_GLASS_LONG_PRESS…');
     await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
     await new Promise(r => setTimeout(r, 500));
+    log('Sending CMD_APP_SHOW_PAIR…');
     await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
     await new Promise(r => setTimeout(r, 200));
+    log('Sending CMD_DIRECT_PAIR…');
     await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
     await new Promise(r => setTimeout(r, 200));
+    log('Sending CMD_CONFIRMATION…');
     await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
     await new Promise(r => setTimeout(r, 500));
 
@@ -294,9 +304,16 @@ async function connect() {
 // ── TX handler ─────────────────────────────────────────────────────────────
 async function onTX(event) {
   const data = new Uint8Array(event.target.value.buffer);
-  if (data[0] === 0x4F && data[1] === 0x42) { notifyAck(); return; }
-  if (data[0] === 0x45 && data[1] === 0x4D && data[2] === 0x15) return; // IMU, ignore
-  const hex = [...data].map(b => b.toString(16).padStart(2,'0')).join(' ');
+  const hex  = [...data].map(b => b.toString(16).padStart(2,'0')).join(' ');
+  if (data[0] === 0x4F && data[1] === 0x42) {
+    log(`TX ACK: ${hex}`);
+    notifyAck();
+    return;
+  }
+  if (data[0] === 0x45 && data[1] === 0x4D && data[2] === 0x15 && data[3] === 0x00) {
+    log('TX IMU (ignored)');
+    return;
+  }
   log(`TX: ${hex}`);
 }
 
@@ -373,11 +390,11 @@ async function disconnect() {
 }
 
 function onDisconnected() {
+  log('*** gattserverdisconnected fired ***', 'err');
   stopAuto();
   writeChar  = null;
   ackResolve = null;
   device     = null;
-  log('Disconnected', 'err');
   btnStart.disabled      = true;
   btnStop.disabled       = true;
   btnReset.disabled      = true;

@@ -107,6 +107,9 @@ Send to Write characteristic:
   to 5 times with a 1-second delay between attempts.
 - A 500 ms delay is inserted after `gatt.connect()` before service discovery to
   give the Windows Bluetooth stack time to settle.
+- The glasses disconnect unexpectedly after ~30 seconds on Windows, likely due to
+  a BLE link supervision timeout in the Windows Bluetooth stack. The demo handles
+  this with automatic reconnect (see Section 8).
 
 ---
 
@@ -341,6 +344,8 @@ TX single byte 01 → long-press prompt (iOS pairing flow)
 
 ## 8. Complete Connection Flow (as implemented in index.html)
 
+### 8.1 Initial connection
+
 ```
 navigator.bluetooth.requestDevice()
   └─ filter: acceptAllDevices, optionalServices: [SERVICE_UUID]
@@ -375,6 +380,32 @@ wait 500 ms
 → Glasses ready. Translation commands can now be sent.
 ```
 
+### 8.2 Auto-reconnect on unexpected disconnect
+
+The glasses may drop the BLE connection unexpectedly (observed at ~30 s on
+Windows). The demo handles this automatically:
+
+```
+gattserverdisconnected event fires
+  └─ writeChar set to null, interval timer cleared
+  └─ if wasAutoRunning → reconnect()
+       └─ device.gatt.connect()  ← retry up to 5× (same device object reused)
+       └─ re-discover characteristics
+       └─ re-run handshake + pairing sequence (identical to initial connection)
+       └─ resume startAuto() automatically
+     else → show Disconnected, re-enable Connect button
+```
+
+**Race condition note:** the `setInterval` tick may fire at the same moment as
+the disconnect event, causing `sendTranslation()` to see `writeChar === null`.
+The demo guards against this:
+
+- `wasAutoRunning` is a dedicated flag set in `startAuto()` / `stopAuto()`,
+  independent of whether `autoTimer` is non-null at the instant of disconnect.
+- `sendTranslation()` returns early (without calling `stopAuto()`) if `writeChar`
+  is null at entry or after a caught error, allowing `reconnect()` to resume the
+  loop instead.
+
 ---
 
 ## 9. File Structure
@@ -391,7 +422,21 @@ All protocol logic lives in `index.html`:
 | `metaCRC32(bytes)` | CRC-32 checksum (custom variant from CRC.swift) |
 | `u16le(v)` / `u32le(v)` | Little-endian byte encoding helpers |
 | `buildTranslationFrames(sessionId, original, translation, mtu)` | Builds one or more BLE frames for the simultaneous translation command |
-| `connect()` | Full connection + pairing sequence |
+| `connect()` | Full connection + pairing sequence (initial connect only) |
+| `reconnect()` | Re-runs handshake + pairing using the existing `device` object after unexpected disconnect; resumes auto-send if `wasAutoRunning` is true |
 | `onTX(event)` | TX notification handler (ACK, pairing events) |
-| `sendTranslation()` | Sends original + translation text to the glasses |
-| `disconnect()` | Sends disconnect command and cleans up state |
+| `sendTranslation()` | Sends original + translation text with incrementing `sendCount` appended; returns early if `writeChar` is null |
+| `startAuto()` | Starts 2-second auto-send interval; sets `wasAutoRunning = true` |
+| `stopAuto()` | Stops auto-send interval; sets `wasAutoRunning = false` |
+| `onDisconnected()` | Handles `gattserverdisconnected` event; clears timer without resetting `wasAutoRunning`; triggers `reconnect()` if auto was running |
+| `disconnect()` | User-initiated disconnect: sends disconnect command and cleans up state |
+
+Key state variables:
+
+| Variable | Purpose |
+|---|---|
+| `writeChar` | Reference to the Write characteristic; set to `null` on any disconnect |
+| `sessionId` | 1-byte translation session counter, wraps 1–255 |
+| `sendCount` | Display counter appended to each sent string; reset by Reset Count button |
+| `autoTimer` | `setInterval` handle; `null` when auto-send is not running |
+| `wasAutoRunning` | Persists intent to auto-send across a disconnect/reconnect cycle |

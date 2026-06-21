@@ -160,7 +160,7 @@ const HANDSHAKE_TOKEN      = new Uint8Array([
 ]);
 
 // ── State ──────────────────────────────────────────────────────────────────
-let device = null, writeChar = null;
+let device = null, writeChar = null, txChar = null;
 let sessionId = 1;
 let sendCount = 1;
 let autoTimer = null;
@@ -256,18 +256,17 @@ async function connect() {
     await new Promise(r => setTimeout(r, 500));
     const service  = await server.getPrimaryService(SERVICE_UUID);
     writeChar      = await service.getCharacteristic(WRITE_UUID);
-    const txChar   = await service.getCharacteristic(TX_UUID);
+    txChar         = await service.getCharacteristic(TX_UUID);
     const hsChar   = await service.getCharacteristic(HANDSHAKE_UUID);
     log('Characteristics ready');
 
-    // Best-effort TX notifications (for ACKs)
+    // Best-effort TX notifications (for ACKs). May fail on Windows before pairing.
+    txChar.addEventListener('characteristicvaluechanged', onTX);
     try {
       await txChar.startNotifications();
-      txChar.addEventListener('characteristicvaluechanged', onTX);
-      log('TX notifications enabled');
+      log('TX notifications enabled (pre-pairing)');
     } catch(e) {
-      log(`TX notifications unavailable (${e.message}) — continuing`);
-      txChar.addEventListener('characteristicvaluechanged', onTX);
+      log(`TX notifications unavailable pre-pairing (${e.message}) — will retry after pairing`);
     }
 
     // Phase 1: handshake token
@@ -306,6 +305,16 @@ async function connect() {
     log('Sending CMD_CONFIRMATION…');
     await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
     await new Promise(r => setTimeout(r, 500));
+
+    // Retry TX notifications now that the BLE link is paired/secured.
+    // On Windows, CCCD writes fail before pairing but may succeed after.
+    log('Retrying TX notifications after pairing…');
+    try {
+      await txChar.startNotifications();
+      log('TX notifications enabled (post-pairing)', 'ok');
+    } catch(e) {
+      log(`TX notifications still unavailable (${e.message}) — ACKs via timeout`);
+    }
 
     log('Glasses ready!', 'ok');
     btnStart.disabled      = false;
@@ -413,6 +422,7 @@ function onDisconnected() {
   longPressResolve = null;
   btnLongPress.style.display = 'none';
   writeChar  = null;
+  txChar     = null;
   ackResolve = null;
   device     = null;
   btnStart.disabled      = true;

@@ -27,6 +27,7 @@
     <label>Translation text</label>
     <input id="translation" type="text" value="こんにちは, 世界" placeholder="Translation" />
   </div>
+  <button id="btnLongPress" style="display:none">Continue (long-press done)</button>
   <button id="btnStart" disabled>Start (2s interval)</button>
   <button id="btnStop" disabled>Stop</button>
   <button id="btnReset" disabled>Reset Count</button>
@@ -191,19 +192,33 @@ function log(msg, cls) {
 // ── UI ─────────────────────────────────────────────────────────────────────
 const btnConnect    = document.getElementById('btnConnect');
 const btnDisconnect = document.getElementById('btnDisconnect');
+const btnLongPress  = document.getElementById('btnLongPress');
 const btnStart      = document.getElementById('btnStart');
 const btnStop       = document.getElementById('btnStop');
 const btnReset      = document.getElementById('btnReset');
 const counterEl     = document.getElementById('counter');
 
+let longPressResolve = null;
+
 btnConnect.addEventListener('click', connect);
 btnDisconnect.addEventListener('click', disconnect);
+btnLongPress.addEventListener('click', () => {
+  btnLongPress.style.display = 'none';
+  if (longPressResolve) { longPressResolve(); longPressResolve = null; }
+});
 btnStart.addEventListener('click', startAuto);
 btnStop.addEventListener('click', stopAuto);
 btnReset.addEventListener('click', () => {
   sendCount = 1;
   counterEl.textContent = `Count: ${sendCount}`;
 });
+
+function waitForUserLongPress() {
+  return new Promise(resolve => {
+    longPressResolve = resolve;
+    btnLongPress.style.display = 'inline-block';
+  });
+}
 
 // ── Connect & handshake ────────────────────────────────────────────────────
 async function connect() {
@@ -275,9 +290,14 @@ async function connect() {
     }
     log('Handshake OK', 'ok');
 
-    // Phase 2: direct pairing without long-press (skipping CMD_GLASS_LONG_PRESS
-    // which triggers a 30-second long-press UI timeout on the glasses firmware)
-    log('Sending CMD_APP_SHOW_PAIR…');
+    // Phase 2: pairing — requires physical long-press on the glasses touch bar.
+    // TX notifications are unavailable on Windows, so we can't detect the long-press
+    // automatically. Show a button and wait for the user to confirm.
+    log('Sending CMD_GLASS_LONG_PRESS…');
+    await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
+    log('*** Long-press the touch bar on your glasses, then click "Continue (long-press done)" ***');
+    await waitForUserLongPress();
+    log('Long-press confirmed — sending pairing commands…');
     await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
     await new Promise(r => setTimeout(r, 200));
     log('Sending CMD_DIRECT_PAIR…');
@@ -390,6 +410,8 @@ async function disconnect() {
 function onDisconnected() {
   log('*** gattserverdisconnected fired ***', 'err');
   stopAuto();
+  longPressResolve = null;
+  btnLongPress.style.display = 'none';
   writeChar  = null;
   ackResolve = null;
   device     = null;

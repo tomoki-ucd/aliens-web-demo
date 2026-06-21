@@ -207,7 +207,22 @@ async function connect() {
     device.addEventListener('gattserverdisconnected', onDisconnected);
 
     log('Connecting to GATT…');
-    const server  = await device.gatt.connect();
+    let server;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        server = await Promise.race([
+          device.gatt.connect(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+        ]);
+        break;
+      } catch (e) {
+        log(`GATT attempt ${attempt} failed (${e.message}), retrying…`);
+        await new Promise(r => setTimeout(r, 1000));
+        if (attempt === 5) throw new Error('Could not establish GATT connection after 5 attempts');
+      }
+    }
+    // Give Windows Bluetooth stack a moment before service discovery
+    await new Promise(r => setTimeout(r, 500));
     const service = await server.getPrimaryService(SERVICE_UUID);
 
     writeChar       = await service.getCharacteristic(WRITE_UUID);

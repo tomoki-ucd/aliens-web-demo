@@ -163,6 +163,7 @@ let device = null, writeChar = null;
 let sessionId = 1;
 let sendCount = 1;
 let autoTimer = null;
+let wasAutoRunning = false;
 
 // ── ACK waiting ────────────────────────────────────────────────────────────
 let ackResolve = null;
@@ -371,13 +372,88 @@ async function disconnect() {
 }
 
 function onDisconnected() {
-  log('Disconnected');
+  wasAutoRunning = autoTimer !== null;
+  stopAuto();
   writeChar  = null;
-  device     = null;
   ackResolve = null;
-  btnConnect.disabled    = false;
-  btnSend.disabled       = true;
+  btnStart.disabled      = true;
+  btnStop.disabled       = true;
+  btnReset.disabled      = true;
   btnDisconnect.disabled = true;
+
+  if (device?.gatt && wasAutoRunning) {
+    log('Disconnected — reconnecting…', 'err');
+    reconnect();
+  } else {
+    log('Disconnected');
+    device = null;
+    btnConnect.disabled = false;
+  }
+}
+
+async function reconnect() {
+  try {
+    let server;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        server = await Promise.race([
+          device.gatt.connect(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+        ]);
+        break;
+      } catch (e) {
+        log(`Reconnect attempt ${attempt} failed (${e.message})`);
+        await new Promise(r => setTimeout(r, 1000));
+        if (attempt === 5) throw new Error('Reconnect failed after 5 attempts');
+      }
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    writeChar     = await service.getCharacteristic(WRITE_UUID);
+    const txChar  = await service.getCharacteristic(TX_UUID);
+    const hsChar  = await service.getCharacteristic(HANDSHAKE_UUID);
+
+    try {
+      await txChar.startNotifications();
+      txChar.addEventListener('characteristicvaluechanged', onTX);
+    } catch(e) {
+      txChar.addEventListener('characteristicvaluechanged', onTX);
+    }
+
+    try {
+      await hsChar.writeValueWithResponse(HANDSHAKE_TOKEN);
+    } catch(e) {
+      await hsChar.writeValueWithoutResponse(HANDSHAKE_TOKEN);
+    }
+    await new Promise(r => setTimeout(r, 250));
+    const hsVal   = await hsChar.readValue();
+    const hsBytes = new Uint8Array(hsVal.buffer);
+    if (hsBytes.length !== 18 || ![0x64, 0x65, 0x66].includes(hsBytes[0])) {
+      throw new Error(`Handshake failed (b0=0x${hsBytes[0]?.toString(16)})`);
+    }
+
+    await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
+    await new Promise(r => setTimeout(r, 500));
+    await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
+    await new Promise(r => setTimeout(r, 200));
+    await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
+    await new Promise(r => setTimeout(r, 200));
+    await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
+    await new Promise(r => setTimeout(r, 500));
+
+    log('Reconnected!', 'ok');
+    btnStart.disabled      = false;
+    btnReset.disabled      = false;
+    btnDisconnect.disabled = false;
+
+    if (wasAutoRunning) startAuto();
+
+  } catch (e) {
+    log(`Reconnect error: ${e.message}`, 'err');
+    device = null;
+    btnConnect.disabled = false;
+  }
 }
 </script>
 </body>

@@ -161,6 +161,7 @@ const HANDSHAKE_TOKEN      = new Uint8Array([
 
 // ── State ──────────────────────────────────────────────────────────────────
 let device = null, writeChar = null, txChar = null;
+let txNotificationsWorking = false;
 let sessionId = 1;
 let sendCount = 1;
 let autoTimer = null;
@@ -260,10 +261,11 @@ async function connect() {
     const hsChar   = await service.getCharacteristic(HANDSHAKE_UUID);
     log('Characteristics ready');
 
-    // Best-effort TX notifications (for ACKs). May fail on Windows before pairing.
-    txChar.addEventListener('characteristicvaluechanged', onTX);
+    // Best-effort TX notifications before pairing. May fail on Windows (CCCD requires bonding).
     try {
       await txChar.startNotifications();
+      txChar.addEventListener('characteristicvaluechanged', onTX);
+      txNotificationsWorking = true;
       log('TX notifications enabled (pre-pairing)');
     } catch(e) {
       log(`TX notifications unavailable pre-pairing (${e.message}) — will retry after pairing`);
@@ -307,13 +309,16 @@ async function connect() {
     await new Promise(r => setTimeout(r, 500));
 
     // Retry TX notifications now that the BLE link is paired/secured.
-    // On Windows, CCCD writes fail before pairing but may succeed after.
-    log('Retrying TX notifications after pairing…');
-    try {
-      await txChar.startNotifications();
-      log('TX notifications enabled (post-pairing)', 'ok');
-    } catch(e) {
-      log(`TX notifications still unavailable (${e.message}) — ACKs via timeout`);
+    if (!txNotificationsWorking) {
+      log('Retrying TX notifications after pairing…');
+      try {
+        await txChar.startNotifications();
+        txChar.addEventListener('characteristicvaluechanged', onTX);
+        txNotificationsWorking = true;
+        log('TX notifications enabled (post-pairing)', 'ok');
+      } catch(e) {
+        log(`TX notifications still unavailable (${e.message}) — ACKs via timeout`);
+      }
     }
 
     log('Glasses ready!', 'ok');
@@ -332,6 +337,7 @@ async function connect() {
 async function onTX(event) {
   const data = new Uint8Array(event.target.value.buffer);
   const hex  = [...data].map(b => b.toString(16).padStart(2,'0')).join(' ');
+
   if (data[0] === 0x4F && data[1] === 0x42) {
     log(`TX ACK: ${hex}`);
     notifyAck();
@@ -339,6 +345,16 @@ async function onTX(event) {
   }
   if (data[0] === 0x45 && data[1] === 0x4D && data[2] === 0x15 && data[3] === 0x00) {
     log('TX IMU (ignored)');
+    return;
+  }
+  // Session-renewal request from glasses (cmdType 0x0010).
+  // Observed ~7 s before disconnect when not responded to — reply with CMD_CONFIRMATION.
+  if (data[0] === 0x45 && data[1] === 0x4D && data[2] === 0x10 && data[3] === 0x00) {
+    log(`TX 0x0010 session-renewal: ${hex} — replying with CMD_CONFIRMATION`);
+    if (writeChar) {
+      writeChar.writeValueWithoutResponse(CMD_CONFIRMATION)
+        .catch(e => log(`0x0010 reply error: ${e.message}`, 'err'));
+    }
     return;
   }
   log(`TX: ${hex}`);
@@ -421,9 +437,10 @@ function onDisconnected() {
   stopAuto();
   longPressResolve = null;
   btnLongPress.style.display = 'none';
-  writeChar  = null;
-  txChar     = null;
-  ackResolve = null;
+  writeChar              = null;
+  txChar                 = null;
+  txNotificationsWorking = false;
+  ackResolve             = null;
   device     = null;
   btnStart.disabled      = true;
   btnStop.disabled       = true;

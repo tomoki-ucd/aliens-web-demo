@@ -162,6 +162,7 @@ const HANDSHAKE_TOKEN      = new Uint8Array([
 // ── State ──────────────────────────────────────────────────────────────────
 let device = null, writeChar = null, txChar = null;
 let txNotificationsWorking = false;
+let isReady = false;
 let sessionId = 1;
 let sendCount = 1;
 let autoTimer = null;
@@ -321,6 +322,7 @@ async function connect() {
       }
     }
 
+    isReady = true;
     log('Glasses ready!', 'ok');
     btnStart.disabled      = false;
     btnReset.disabled      = false;
@@ -347,13 +349,32 @@ async function onTX(event) {
     log('TX IMU (ignored)');
     return;
   }
-  // Session-renewal request from glasses (cmdType 0x0010).
-  // Observed ~7 s before disconnect when not responded to — reply with CMD_CONFIRMATION.
+  // cmdType 0x0010 — logged for investigation; reply with CMD_CONFIRMATION.
   if (data[0] === 0x45 && data[1] === 0x4D && data[2] === 0x10 && data[3] === 0x00) {
-    log(`TX 0x0010 session-renewal: ${hex} — replying with CMD_CONFIRMATION`);
+    log(`TX 0x0010: ${hex} — replying with CMD_CONFIRMATION`);
     if (writeChar) {
       writeChar.writeValueWithoutResponse(CMD_CONFIRMATION)
         .catch(e => log(`0x0010 reply error: ${e.message}`, 'err'));
+    }
+    return;
+  }
+  // TX [0x01]: glasses requesting long-press flow.
+  // After pairing (isReady), TX notifications are working so respond automatically
+  // with the full pairing sequence — physical long-press already done in round 1.
+  if (data.length === 1 && data[0] === 0x01) {
+    if (isReady && writeChar) {
+      log('TX: 01 — post-ready long-press request, responding automatically');
+      (async () => {
+        await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
+        await new Promise(r => setTimeout(r, 300));
+        await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
+        await new Promise(r => setTimeout(r, 200));
+        await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
+        await new Promise(r => setTimeout(r, 200));
+        await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
+      })().catch(e => log(`Auto re-pair error: ${e.message}`, 'err'));
+    } else {
+      log('TX: 01 (during initial pairing)');
     }
     return;
   }
@@ -440,6 +461,7 @@ function onDisconnected() {
   writeChar              = null;
   txChar                 = null;
   txNotificationsWorking = false;
+  isReady                = false;
   ackResolve             = null;
   device     = null;
   btnStart.disabled      = true;

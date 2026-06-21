@@ -242,22 +242,24 @@ async function connect() {
     log(`TX properties: notify=${txProps.notify} indicate=${txProps.indicate} write=${txProps.write} writeWithoutResponse=${txProps.writeWithoutResponse}`);
     log(`HS properties: notify=${hsProps.notify} indicate=${hsProps.indicate} write=${hsProps.write} writeWithoutResponse=${hsProps.writeWithoutResponse}`);
 
-    // Listen on TX for ACKs and pairing events
+    // Best-effort TX notifications (needed for ACKs during drawing)
     log('Starting TX notifications…');
+    let txNotifyWorking = false;
     try {
       await txChar.startNotifications();
+      txChar.addEventListener('characteristicvaluechanged', onTX);
+      txNotifyWorking = true;
       log('TX notifications started');
     } catch(e) {
-      log(`TX startNotifications failed: ${e.message} — continuing anyway`);
+      log(`TX notifications unavailable (${e.message}) — using proactive pairing`);
+      txChar.addEventListener('characteristicvaluechanged', onTX);
     }
-    txChar.addEventListener('characteristicvaluechanged', onTX);
 
     // ── Phase 1: token handshake ──
     log('Writing handshake token…');
     try {
       await hsChar.writeValueWithResponse(HANDSHAKE_TOKEN);
     } catch(e) {
-      log(`writeValueWithResponse failed (${e.message}), trying withoutResponse…`);
       await hsChar.writeValueWithoutResponse(HANDSHAKE_TOKEN);
     }
     log('Handshake token sent, waiting…');
@@ -270,10 +272,24 @@ async function connect() {
     if (hsBytes.length !== 18 || hsBytes[0] !== 0x64) {
       throw new Error(`Handshake failed (len=${hsBytes.length}, b0=0x${hsBytes[0]?.toString(16)})`);
     }
-    log('Handshake OK — waiting for pairing prompt on glasses…', 'ok');
-    log('(Long-press the glasses button if prompted)');
+    log('Handshake OK', 'ok');
 
-    // Phase 2 & 3 continue in onTX()
+    // ── Phase 2 & 3: pairing ──
+    // TX notifications don't work on Windows, so send pairing commands proactively
+    log('Sending pairing commands…');
+    await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
+    await new Promise(r => setTimeout(r, 500));
+    await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
+    await new Promise(r => setTimeout(r, 200));
+    await writeChar.writeValueWithoutResponse(CMD_DIRECT_PAIR);
+    await new Promise(r => setTimeout(r, 200));
+    await writeChar.writeValueWithoutResponse(CMD_CONFIRMATION);
+    await new Promise(r => setTimeout(r, 500));
+
+    log('Glasses ready!', 'ok');
+    btnHello.disabled      = false;
+    btnDisconnect.disabled = false;
+    btnConnect.disabled    = true;
 
   } catch (e) {
     log(`Error: ${e.message}`, 'err');

@@ -367,15 +367,23 @@ async function onTX(event) {
   if (data[0] === 0x4F && data[1] === 0x42) {
 
     // BT status response (4F 42 3A 00 ..., ≥11 bytes) — reply to CMD_BT_STATUS_POLL
-    // iOS SDK: extracts result[8], bonded[last-1], classicConnected[last]
+    // Last byte = 0x01 means connection successful (BLE and/or Classic BT confirmed).
     if (data[2] === 0x3A && data[3] === 0x00 && data.length >= 11) {
-      const result          = data[8];
-      const bonded          = data[data.length - 2] === 0x01;
-      const classicConnected = data[data.length - 1] === 0x01;
-      log(`TX BT status: result=0x${result.toString(16)} bonded=${bonded} classicConnected=${classicConnected} [${hex}]`);
-      if (result === 0 && classicConnected) {
-        log('BT confirmed — connection fully established!', 'ok');
+      const result    = data[8];
+      const bonded    = data[data.length - 2] === 0x01;
+      const connected = data[data.length - 1] === 0x01;
+      log(`TX BT status: result=0x${result.toString(16)} bonded=${bonded} connected=${connected} [${hex}]`);
+      if (connected) {
+        log('Connection confirmed (BT status last byte=0x01)', 'ok');
         stopBtStatusPolling();
+        if (!isReady) {
+          isReady = true;
+          log('Glasses fully ready!', 'ok');
+          btnStart.disabled      = false;
+          btnReset.disabled      = false;
+          btnDisconnect.disabled = false;
+          btnConnect.disabled    = true;
+        }
       }
       return;
     }
@@ -390,15 +398,17 @@ async function onTX(event) {
     }
 
     // longPressConfirmResponse = 4F 42 00 00 01 00 02 00 00 (last byte 0x00)
-    // iOS SDK: send getPhoneSystemModelCommand (APP_SHOW_PAIR) only — no DIRECT_PAIR, no CONFIRMATION
+    // Android SDK: send APP_SHOW_PAIR then declare connected immediately (no Classic BT wait).
+    // Also start BT polling as keepalive — critical for Windows where classicConnected never fires.
     if (data.length === 9 &&
         data[2]===0x00 && data[3]===0x00 && data[4]===0x01 &&
         data[5]===0x00 && data[6]===0x02 && data[7]===0x00 && data[8]===0x00) {
-      log(`TX longPressConfirmResponse: ${hex} — sending CMD_APP_SHOW_PAIR`);
+      log(`TX longPressConfirmResponse: ${hex} — sending CMD_APP_SHOW_PAIR + starting BT polling`);
       if (writeChar) {
         writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR)
           .catch(e => log(`APP_SHOW_PAIR error: ${e.message}`, 'err'));
       }
+      startBtStatusPolling();
       return;
     }
 
@@ -452,16 +462,15 @@ async function onTX(event) {
   }
 
   // ── TX [0x01] — glasses requesting long-press ────────────────────────────
-  // iOS SDK: if no saved token → send glassShowLongPressCommand; waits for longPressConfirmResponse
-  //          if saved token   → pairingAcknowledged=true, beginClassicPairingConfirmation
-  // On Windows we always go through the long-press path (no saved token concept).
+  // Android SDK pattern: immediately send CMD_GLASS_LONG_PRESS + CMD_APP_SHOW_PAIR together.
+  // (iOS sends only CMD_GLASS_LONG_PRESS here, then APP_SHOW_PAIR after longPressConfirmResponse.)
   if (data.length === 1 && data[0] === 0x01) {
-    if (isReady && writeChar) {
-      log('TX: 01 — sending CMD_GLASS_LONG_PRESS (awaiting longPressConfirmResponse)');
-      writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS)
-        .catch(e => log(`CMD_GLASS_LONG_PRESS error: ${e.message}`, 'err'));
-    } else {
-      log('TX: 01 (during initial pairing — will be handled by TX events)');
+    if (writeChar) {
+      log('TX: 01 — sending CMD_GLASS_LONG_PRESS + CMD_APP_SHOW_PAIR');
+      (async () => {
+        await writeChar.writeValueWithoutResponse(CMD_GLASS_LONG_PRESS);
+        await writeChar.writeValueWithoutResponse(CMD_APP_SHOW_PAIR);
+      })().catch(e => log(`TX 01 response error: ${e.message}`, 'err'));
     }
     return;
   }
